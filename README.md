@@ -12,6 +12,17 @@ tied to one model.
     tablet ── Folio app (QML in xochitl) ──► folio-bridge ──► claude -p
                                          └─► folio-server ──► the builder agent, versions, notes search
 
+<p>
+  <img src="docs/screens/page.png" width="200" alt="The page: a handwritten question, the typeset answer, a drawing and a change card">
+  <img src="docs/screens/more.png" width="200" alt="More: the page, what to show, the model and effort, how to send, and Folio's notes">
+  <img src="docs/screens/activity.png" width="200" alt="Activity: a build that is running and a finished notes search">
+  <img src="docs/screens/job.png" width="200" alt="A build's log: each step of the builder agent">
+</p>
+
+The page with a question, its answer and a change card; **More**; **Activity**;
+and a build's log. `test/shots.sh` renders these offscreen, with sample
+content.
+
 `ARCHITECTURE.md` is the full description: the parts, how an ask and a build
 flow, trust, and the landmines. `CLAUDE.md` is how to work on the code; the
 builder reads it too.
