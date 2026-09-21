@@ -1,0 +1,8 @@
+{
+    "name": "Folio",
+    "loadsBackend": true,
+    "entry": "/ui/loader.qml",
+    "id": "claude",
+    "supportsScaling": true,
+    "canHaveMultipleFrontends": false
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Start xovi (AppLoad and Folio) after a stock boot, with a fallback to stock
+RequiresMountsFor=/home/root
+Wants=xochitl.service
+After=xochitl.service
+# touch it over ssh to keep the tablet stock
+ConditionPathExists=!/home/root/folio/no-xovi
+ConditionPathExists=/home/root/xovi/start
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash /home/root/folio/xovi-boot.sh
+
+[Install]
+WantedBy=multi-user.target

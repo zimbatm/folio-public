@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# install-version vN: put tag vN of this repo into the tablet's
+# code/vN and point code/current at it. Not a/b as Folio's own Install does:
+# xochitl keeps each QML file it parsed (or failed to parse) by its path until
+# it restarts, so a reused path can run the old code. The loader is built into
+# the rcc, so a version carries every ui/ file but ui/loader.qml.
+set -euo pipefail
+v=$1
+cd "$(dirname "$(readlink -f "$0")")/.."
+tablet=${FOLIO_TABLET:-remarkable}
+files=$(git ls-tree --name-only "$v" ui/ | grep -E '\.(qml|js)$' | grep -v '^ui/loader.qml$')
+# shellcheck disable=SC2086
+git archive "$v" $files | ssh "$tablet" "set -e
+d=/home/root/.local/share/claude-app/code
+n=$v
+[ -e \$d/\$n ] && n=$v-\$(date +%s)
+rm -rf /tmp/folio-version && mkdir -p /tmp/folio-version \$d/\$n && tar -xf - -C /tmp/folio-version
+cp /tmp/folio-version/ui/* \$d/\$n/ && echo $v > \$d/\$n/VERSION && echo \$n > \$d/current
+rm -rf /tmp/folio-version
+echo \"current=\$n (\$(cat \$d/\$n/VERSION)); files: \$(ls \$d/\$n | tr '\n' ' ')\""

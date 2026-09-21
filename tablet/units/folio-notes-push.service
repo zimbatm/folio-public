@@ -1,0 +1,9 @@
+[Unit]
+Description=Push the notebooks to the Folio server (the notes mirror)
+RequiresMountsFor=/home/root
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /home/root/folio/notes-push.sh

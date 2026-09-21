@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# shot OUT.png: screenshot the tablet (half size)
+set -euo pipefail
+out=${1:-shot.png}
+raw=$(mktemp)
+trap 'rm -f "$raw"' EXIT
+tablet=${FOLIO_TABLET:-remarkable}
+ssh "$tablet" '/home/root/folio/tools/fbgrab /tmp/fb.raw'
+scp -q "$tablet:/tmp/fb.raw" "$raw"
+nix run nixpkgs#imagemagick -- -size 960x1696 -depth 8 "RGBA:$raw" -resize 50% "$out"

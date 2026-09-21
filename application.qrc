@@ -1,0 +1,15 @@
+<RCC>
+    <qresource>
+        <file>ui/loader.qml</file>
+        <file>ui/main.qml</file>
+        <file>ui/ink.js</file>
+        <file>ui/markdown.js</file>
+        <file>ui/net.js</file>
+        <file>ui/diag.js</file>
+        <file>ui/prompt.js</file>
+        <file>ui/Button.qml</file>
+        <file>ui/BackButton.qml</file>
+        <file>ui/BarButton.qml</file>
+        <file>ui/TypedWord.qml</file>
+    </qresource>
+</RCC>

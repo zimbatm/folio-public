@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <rect width="256" height="256" fill="white"/>
+  <!-- the page, its top-right corner folded -->
+  <path d="M60 28 H164 L208 72 V228 H60 Z" fill="none" stroke="black" stroke-width="12" stroke-linejoin="round"/>
+  <path d="M164 28 V72 H208" fill="none" stroke="black" stroke-width="12" stroke-linejoin="round"/>
+  <!-- a line of handwriting -->
+  <path d="M82 154 C92 150 100 136 98 128 C96 120 86 124 88 136 C90 150 104 156 114 146 C122 138 124 130 120 128 C114 126 112 142 122 150 C132 158 142 146 146 136 C148 130 144 126 140 132 C136 140 144 154 156 152 C166 150 174 140 186 138" fill="none" stroke="black" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- the answer, set in type -->
+  <path d="M84 186 H184 M84 206 H150" fill="none" stroke="black" stroke-width="8" stroke-linecap="round"/>
+  <!-- a spark: the assistant -->
+  <path d="M112 62 L118 86 L142 92 L118 98 L112 122 L106 98 L82 92 L106 86 Z" fill="black"/>
+</svg>

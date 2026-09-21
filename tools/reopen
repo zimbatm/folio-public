@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# reopen: close the fullscreen app, reload AppLoad's list, open the first app (Folio)
+ssh "${FOLIO_TABLET:-remarkable}" 'R=/home/root/folio/tools/rmin; $R swipe 480 4 480 850; sleep 0.8; $R tap 920 36; sleep 1.5; $R tap 880 54; sleep 2; $R tap 140 204; sleep 3'
