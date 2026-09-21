@@ -51,7 +51,6 @@ Item {
             const r = app.item;
             r.dataDir = Qt.resolvedUrl("tmp").toString();
             r.newPage();
-            r.sendMode = "button";
             shot("01-empty");
 
             write(r, "WHAT IS A", 60, 170);
@@ -105,13 +104,34 @@ Item {
             shot("08-activity-log");
             r.activityOpen = false;
 
-            r.lassoMode = true;
-            shot("09-lasso");
-            r.lassoMode = false;
+            r.armAsk();
+            shot("09-ask-armed");
+            r.disarmAsk();
 
             r.setBar(false);
             shot("10-bar-hidden");
             r.setBar(true);
+
+            // a reading sent from the computer, marked with the pen
+            r.mergeInbox([{ id: "d1shots0001", title: "Rollout plan", from: "laptop", state: "new" },
+                          { id: "d2shots0002", title: "PR #41: the new inbox", from: "laptop", state: "new" }]);
+            r.pagesOpen = true;
+            shot("11-pages");
+            r.showPage("d1shots0001");
+            tryVerify(() => r.pageLoaded, 3000);
+            r.placeDocument({ id: "d1shots0001", title: "Rollout plan", from: "laptop", kind: "markdown",
+                content: "# Rollout plan\n\nWe ship in three steps, each behind a flag, so any step can wait.\n\n" +
+                         "## 1. The API\n\nThe new endpoints go live first. Clients keep the old ones for two weeks.\n\n" +
+                         "## 2. The users\n\nWe migrate the accounts in batches of a thousand, at night, and check each batch.\n\n" +
+                         "## 3. The old service\n\nIt stays read-only for a month, then it goes away.\n\n" +
+                         "## Risks\n\n- The migration may be slower than planned.\n- Support needs a script for the change." });
+            wait(600);
+            r.setPageState("d1shots0001", "reading");
+            r.status = "";
+            wait(300);
+            write(r, "WHAT?", 700, 360);
+            stroke(r, [[60, 610], [880, 610]]);
+            shot("12-reading");
         }
     }
 }

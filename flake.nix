@@ -14,6 +14,7 @@
     in
     {
       packages = forAllSystems (pkgs: {
+        folio = import ./cli { inherit pkgs; };
         folio-server = import ./server { inherit pkgs; };
         folio-bridge = import ./bridge { inherit pkgs; };
         rmc = import ./server/rmc.nix { inherit pkgs; };

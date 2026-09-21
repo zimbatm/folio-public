@@ -103,7 +103,11 @@ function erase(x, y, d, skip) {
 }
 
 // removes these strokes as part of the current eraser stroke
+// the strokes the last erase removed, for what changed since the last ask
+var lastErased = [];
+
 function eraseList(hit) {
+    lastErased = hit;
     if (!hit.length) return null;
     for (var i = 0; i < hit.length; i++) remove(hit[i]);
     var last = history[history.length - 1];
@@ -361,7 +365,10 @@ function save() {
     return strokes.map(function (s) {
         var flat = [];
         for (var i = 0; i < s.p.length; i++) flat.push(Math.round(s.p[i].x), Math.round(s.p[i].y));
-        return s.w >= 0 ? { t: s.turn, p: flat, w: s.w } : { t: s.turn, p: flat };
+        var o = { t: s.turn, p: flat };
+        if (s.w >= 0) o.w = s.w;
+        if (s.d) o.d = s.d;
+        return o;
     });
 }
 
@@ -371,7 +378,7 @@ function load(saved) {
         var f = saved[i].p;
         if (!f || f.length < 2) continue;
         var s = { p: [], x0: f[0], y0: f[1], x1: f[0], y1: f[1], turn: saved[i].t,
-                  w: saved[i].w >= 0 ? saved[i].w : -1 };
+                  w: saved[i].w >= 0 ? saved[i].w : -1, d: saved[i].d || "" };
         for (var k = 0; k + 1 < f.length; k += 2) {
             var pt = { x: f[k], y: f[k + 1] };
             s.p.push(pt);
@@ -485,4 +492,22 @@ function inside(l, x, y) {
         if ((p[i].y > y) !== (p[j].y > y) && x < (p[j].x - p[i].x) * (y - p[i].y) / (p[j].y - p[i].y) + p[i].x) yes = !yes;
     }
     return yes;
+}
+
+// What the assistant saw in a region of ink that is no text (a drawing, a
+// mark): kept on its strokes, so it reads each piece once
+function describe(r, text) {
+    for (var i = 0; i < strokes.length; i++) {
+        var s = strokes[i];
+        if (s.turn === r.turn && s.x0 >= r.x0 && s.x1 <= r.x1 && s.y0 >= r.y0 && s.y1 <= r.y1) s.d = text;
+    }
+}
+
+// the description of the strokes in region r, if they have one
+function described(r) {
+    for (var i = 0; i < strokes.length; i++) {
+        var s = strokes[i];
+        if (s.d && s.turn === r.turn && s.x0 >= r.x0 && s.x1 <= r.x1 && s.y0 >= r.y0 && s.y1 <= r.y1) return s.d;
+    }
+    return "";
 }

@@ -46,7 +46,7 @@ function expire() {
 var UA = "Mozilla/5.0 (Linux; reMarkable Paper Pro Move) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 Folio/1";
 
 // GET `url`. opts: timeout (ms), max (bytes), binary (an ArrayBuffer, not
-// text). done(error, { status, type, text, data }): error is "" or why it
+// text), headers. done(error, { status, type, text, data }): error is "" or why it
 // failed, in words for the user.
 function get(url, opts, done) {
     var x = xhr(), ended = false, secs = Math.round((opts.timeout || 15000) / 1000);
@@ -73,6 +73,7 @@ function get(url, opts, done) {
         x.open("GET", url);
         x.setRequestHeader("User-Agent", UA);
         x.setRequestHeader("Accept-Language", "en;q=0.9, *;q=0.5");
+        for (var h in opts.headers || {}) x.setRequestHeader(h, opts.headers[h]);
         x.send();
     } catch (e) {
         ended = true;

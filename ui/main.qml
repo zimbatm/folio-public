@@ -55,7 +55,7 @@ Rectangle {
     // rests. Hidden, a tab at the top edge brings it back.
     property bool barShown: true
     readonly property int barHeight: 84
-    readonly property int barButtons: 6
+    readonly property int barButtons: 5
     // the gap before Close is 40 px wider than the others
     readonly property real barCell: (width - 32 - (barButtons - 1) * 8 - 40) / barButtons
     // room to write: a stroke that ends this close to the bottom of the
@@ -85,22 +85,17 @@ Rectangle {
     // which layers show: both, user (only the ink) or replies
     property string layers: "both"
     readonly property var layerLabels: ({ both: "Show both", user: "Show ink", replies: "Show replies" })
-    // what sends the new ink: the Ask button only, a pause, a check mark or a
-    // double tap (the tablet fonts may have no ✓)
-    readonly property var sendModes: [
-        { id: "button", label: "Ask button only", help: "Tap Ask to send what you wrote." },
-        { id: "pause", label: "Pause", help: "Stop writing for a moment and it sends by itself." },
-        { id: "mark", label: "Check mark", help: "Draw a small check mark (a tick) anywhere to send. The mark is not kept." },
-        { id: "double", label: "Double tap", help: "Double tap the page with a finger to send." }
-    ]
-    // a pause: it needs no extra step, like writing on paper
-    property string sendMode: "pause"
-    property real pauseSecs: 4
-    readonly property var pauseChoices: [2, 4, 8]
+    // Ask arms the lasso: the next loop is the request, or a second tap asks
+    // about the whole page. Nothing else sends (docs/DESIGN.md)
+    property bool askArmed: false
+    // what the agent is told changed: old ink erased since the last ask
+    property var erasedSince: []
+    // the agent's own summary of the page, which stands for the older turns
+    property string pageSummary: ""
 
     // Handwriting the assistant has read shows as black type in its place (`typed`);
     // off, the page shows the ink as written. The ink is kept either way.
-    property bool showType: true
+    property bool showType: false
     // conversion waits until the pen has rested this long
     property int typingDelay: 2500
     property real lastPen: 0
@@ -110,8 +105,6 @@ Rectangle {
     property bool fixBusy: false
     property bool fixBelow: true
     property int fixStrokes: 0
-    property var pendingWord: -1
-    property real tapSentAt: 0
 
     // the bridge accepts exactly these (bridge/main.go)
     readonly property var models: [
@@ -244,6 +237,7 @@ Rectangle {
                 if (m[1] === "FOLIO_SERVER_TOKEN") serverToken = v;
             }
             if (!apiKey || !baseUrl) status = "No ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL in " + file;
+            refreshInbox();
         });
     }
 
@@ -256,12 +250,11 @@ Rectangle {
                 const e = efforts.findIndex(x => x.id === st.effort);
                 if (m >= 0) modelIndex = m;
                 if (e >= 0) effortIndex = e;
-                if (sendModes.some(x => x.id === st.send)) sendMode = st.send;
-                if (pauseChoices.indexOf(st.pause) >= 0) pauseSecs = st.pause;
                 // "claude": its name before 2026-09-21
                 const lay = st.layers === "claude" ? "replies" : st.layers;
                 if (layerLabels[lay]) layers = lay;
-                if (typeof st.type === "boolean" && st.type !== showType) { showType = st.type; inkLayer.redrawAll(); }
+                // before settings v2, type was on by default: ink stays ink now
+                if (st.v >= 2 && typeof st.type === "boolean" && st.type !== showType) { showType = st.type; inkLayer.redrawAll(); }
                 if (typeof st.bar === "boolean") barShown = st.bar;
             } catch (e) {
                 console.log("Folio: bad settings.json: " + e);
@@ -272,7 +265,7 @@ Rectangle {
     function saveSettings() {
         filePut(dataDir + "/settings.json", JSON.stringify({
             model: models[modelIndex].id, effort: efforts[effortIndex].id,
-            send: sendMode, pause: pauseSecs, layers: layers, type: showType, bar: barShown
+            v: 2, layers: layers, type: showType, bar: barShown
         }));
     }
 
@@ -304,14 +297,18 @@ Rectangle {
                                 calls: (pending.calls || []).map(c => ({ name: c.name, input: c.input, text: c.text })) } : null;
         const loop = Ink.lasso ? { id: Ink.lasso.id, p: Ink.flatLoop(Ink.lasso) } : null;
         const opening = openingReplies.map(j => ({ specs: j.specs, ctx: saveCtx(j.ctx), turn: j.turn, cursor: j.cursor }));
-        return { version: 2, strokes: Ink.save(), items: its, turns: ts, typed: words, ask: ask, lasso: loop, opening: opening };
+        return { version: 2, strokes: Ink.save(), items: its, turns: ts, typed: words, ask: ask, lasso: loop, opening: opening,
+                 erased: erasedSince, summary: pageSummary, words: docWords };
     }
 
     function restorePage(st) {
         Ink.load(st.strokes || []);
         Ink.setLasso(st.lasso ? Ink.makeLoop(st.lasso.p, +st.lasso.id || 0) : null);
         lassoId = Ink.lasso ? Ink.lasso.id : 0;
-        lassoMode = lassoing = lassoLast = false;
+        lassoMode = lassoing = lassoLast = askArmed = false;
+        erasedSince = Array.isArray(st.erased) ? st.erased : [];
+        pageSummary = String(st.summary || "");
+        docWords = st.words && typeof st.words === "object" ? st.words : {};
         items.clear();
         turns.clear();
         markers.clear();
@@ -350,7 +347,7 @@ Rectangle {
     function savePage() {
         saveTimer.stop();
         if (!pageLoaded) return;
-        filePut(dataDir + "/page.json", JSON.stringify(pageState()));
+        filePut(pageFile(pageId), JSON.stringify(pageState()));
     }
 
     function scheduleSave() {
@@ -358,7 +355,7 @@ Rectangle {
     }
 
     function loadPage() {
-        fileGet(dataDir + "/page.json", text => {
+        fileGet(pageFile(pageId), text => {
             if (text) {
                 try { restorePage(JSON.parse(text)); }
                 catch (e) {
@@ -381,7 +378,8 @@ Rectangle {
     }
 
     function newPage() {
-        if (busy) return;
+        // a reading page holds its document
+        if (busy || readingPage) return;
         // the pages' greyscale images, kept beside page.json (QML cannot
         // delete files: they are emptied)
         for (let i = 0; i < items.count; i++)
@@ -399,7 +397,10 @@ Rectangle {
         closeFix();
         strokeCount = 0;
         lassoId = 0;
-        lassoMode = lassoing = lassoLast = false;
+        lassoMode = lassoing = lassoLast = askArmed = false;
+        erasedSince = [];
+        pageSummary = "";
+        docWords = {};
         roomTimer.stop();
         scrollAnim.stop();
         pageBottom = 0;
@@ -409,13 +410,212 @@ Rectangle {
         status = "";
     }
 
+    // ---- pages: the conversation, and a page for each reading sent from the
+    // computer (docs/DESIGN.md)
+
+    property string pageId: "main"
+    property var pagesIndex: [{ id: "main", kind: "main", title: "Conversation", state: "" }]
+    property bool pagesOpen: false
+    readonly property var currentPage: pagesIndex.find(p => p.id === pageId) || pagesIndex[0]
+    readonly property bool readingPage: currentPage.kind === "reading"
+    readonly property int toRead: pagesIndex.filter(p => p.state === "new").length
+    property bool barBeforeReading: true
+
+    function pageFile(id) { return dataDir + (id === "main" ? "/page.json" : "/page-" + id + ".json"); }
+
+    function savePages() {
+        filePut(dataDir + "/pages.json", JSON.stringify({ current: pageId, pages: pagesIndex }));
+    }
+
+    function loadPages(done) {
+        fileGet(dataDir + "/pages.json", text => {
+            try {
+                const st = text ? JSON.parse(text) : null;
+                if (st && Array.isArray(st.pages) && st.pages.some(p => p.id === "main")) pagesIndex = st.pages;
+                if (st && pagesIndex.some(p => p.id === st.current)) pageId = st.current;
+            } catch (e) {
+                console.log("Folio: bad pages.json: " + e);
+            }
+            if (readingPage) { barBeforeReading = barShown; barShown = false; }
+            done();
+        });
+    }
+
+    // the server's inbox (what was sent to read) into the list of pages
+    function mergeInbox(docs) {
+        const list = pagesIndex.slice();
+        let changed = false;
+        for (const d of docs) {
+            if (!d || !d.id || list.some(p => p.id === d.id) || d.state === "done") continue;
+            list.push({ id: d.id, kind: "reading", title: String(d.title || "Untitled"), from: String(d.from || ""), state: "new",
+                        created: String(d.created || "") });
+            changed = true;
+        }
+        if (changed) { pagesIndex = list; savePages(); }
+    }
+
+    function refreshInbox() {
+        server("GET", "/v1/inbox", null, (st, r) => { if (st === 200 && Array.isArray(r)) mergeInbox(r); });
+    }
+
+    function setPageState(id, state) {
+        pagesIndex = pagesIndex.map(p => p.id === id ? Object.assign({}, p, { state: state }) : p);
+        savePages();
+    }
+
+    function showPage(id) {
+        pagesOpen = false;
+        if (id === pageId) return;
+        const p = pagesIndex.find(x => x.id === id);
+        if (!p) return;
+        if (busy || webBusy) { status = "Wait for the answer first."; return; }
+        savePage();
+        const wasReading = readingPage;
+        pageId = id;
+        savePages();
+        pageLoaded = false;
+        restorePage({ strokes: [], items: [], turns: [] });
+        status = "";
+        // a reading page opens without the toolbar
+        if (p.kind === "reading" && !wasReading) { barBeforeReading = barShown; barShown = false; }
+        if (p.kind !== "reading" && wasReading) barShown = barBeforeReading;
+        fileGet(pageFile(id), text => {
+            if (pageId !== id) return;
+            if (text) {
+                try { restorePage(JSON.parse(text)); }
+                catch (e) { console.log("Folio: bad " + pageFile(id) + ": " + e); }
+                pageLoaded = true;
+                return;
+            }
+            pageLoaded = true;
+            if (p.kind === "reading") {
+                status = "Opening " + p.title + "…";
+                server("GET", "/v1/inbox/" + id, null, (st, d) => {
+                    if (pageId !== id) return;
+                    if (st !== 200 || !d) { status = "Failed: cannot get " + p.title + " from the server. " + (unreachable(st) || ""); return; }
+                    status = "";
+                    placeDocument(d);
+                    setPageState(id, "reading");
+                    server("POST", "/v1/inbox/" + id, { state: "reading" }, () => {});
+                });
+            }
+        });
+    }
+
+    // a document to read, as reader-view parts at the top of its page
+    function placeDocument(d) {
+        const site = d.from ? "sent from " + d.from : "sent to read";
+        if (Array.isArray(d.pages) && d.pages.length) { placePages(d, site); return; }
+        if (d.kind === "url") {
+            placeLater([{ kind: "web", url: d.url, place: "below" }], context(), -1, margin);
+            return;
+        }
+        // pictures in a document are left out: nothing here can fetch them
+        const md = String(d.content || "").split("\n").filter(l => !/^\s*!\[[^\]]*\]\([^)]*\)\s*$/.test(l)).join("\n");
+        const parts = Markdown.split(md, partChars, 0).filter(s => s.trim());
+        const specs = parts.map((s, k) => ({ kind: "web", place: "below", content: s, url: "folio:doc/" + d.id, title: String(d.title || ""),
+                                             site: site, mode: "reader", part: k, parts: parts.length, imgs: "[]", rest: "", webState: "end" }));
+        // below the title row, which lies over the top of the page
+        placeItems(specs, context(), -1, { cursor: 60 + margin });
+        updateBottom();
+        savePage();
+    }
+
+    // a PDF or a picture: one page image after the other, each with its words
+    // (by box, in page units), for reading the marks on it
+    property var docWords: ({})
+    function placePages(d, site) {
+        const id = pageId, n = Math.min(d.pages.length, 60);
+        const words = {};
+        const specs = [];
+        const next = k => {
+            if (pageId !== id) return;
+            if (k >= n) {
+                docWords = words;
+                placeItems(specs, context(), -1, { cursor: 60 + margin });
+                updateBottom();
+                savePage();
+                status = "";
+                return;
+            }
+            const src = serverUrl + "/v1/inbox/" + d.id + "/page/" + (k + 1);
+            status = "Opening page " + (k + 1) + " of " + n + "…";
+            greyImage(src, { w: pageWidth - 2 * margin, h: 1600, timeout: 30000 }, r => {
+                if (!r.error) {
+                    const p = d.pages[k];
+                    words[src] = { w: p.w, h: p.h, words: p.words || [] };
+                    specs.push({ kind: "web", place: "below", content: "![page " + (k + 1) + "](" + src + ")", url: "folio:doc/" + d.id,
+                                 title: String(d.title || ""), site: site, mode: "reader", part: k, parts: n,
+                                 imgs: JSON.stringify([{ src: src, w: r.w, h: r.h }]), rest: "", webState: "end" });
+                }
+                next(k + 1);
+            });
+        };
+        next(0);
+    }
+
+    // the words under a box on a page image, in reading order
+    function wordsUnder(pg, bx) {
+        return pg.words.filter(w => w.x1 > bx.x0 && w.x0 < bx.x1 && w.y1 > bx.y0 && w.y0 < bx.y1)
+            .sort((a, b) => Math.abs(a.y0 - b.y0) > 4 ? a.y0 - b.y0 : a.x0 - b.x0).map(w => w.t).join(" ");
+    }
+
+    function docText() {
+        let s = "";
+        for (let i = 0; i < items.count; i++) {
+            const it = items.get(i);
+            if (it.kind !== "web" || it.url.indexOf("folio:doc/") !== 0) continue;
+            const im = imgsOf(it)[0], pg = im && docWords[im.src];
+            s += pg ? "Page " + (it.part + 1) + ": " + pg.words.map(w => w.t).join(" ") + "\n\n" : it.content + "\n\n";
+        }
+        return s;
+    }
+
+    // every mark on the document: the text under each ink region
+    function docMarks(ctx) {
+        const out = [];
+        ctx.regions.forEach((b, k) => {
+            for (let i = 0; i < items.count && out.length < 80; i++) {
+                const it = items.get(i);
+                if (it.kind !== "web" || it.mode === "screenshot") continue;
+                if (b.x1 < it.px || b.x0 > it.px + it.pw || b.y1 < it.py || b.y0 > it.py + it.ph) continue;
+                const d = replyItems.itemAt(i);
+                let t = d ? d.textIn(b.x0, b.y1 - b.y0 <= 30 ? b.y0 - 30 : b.y0, b.x1, b.y1) : "";
+                // a page image: the words under the mark, by their boxes
+                for (const ib of d ? d.imageBoxes() : []) {
+                    const pg = docWords[ib.src];
+                    if (!pg || !pg.words.length || b.x1 < ib.x || b.x0 > ib.x + ib.w || b.y1 < ib.y || b.y0 > ib.y + ib.h) continue;
+                    const sx = pg.w / ib.w, sy = pg.h / ib.h, lift = b.y1 - b.y0 <= 30 ? 30 : 0;
+                    t = (t ? t + " " : "") + wordsUnder(pg, { x0: (b.x0 - ib.x) * sx, x1: (b.x1 - ib.x) * sx,
+                                                              y0: (b.y0 - lift - ib.y) * sy, y1: (b.y1 - ib.y) * sy });
+                }
+                if (t) out.push("- i" + (k + 1) + " (x " + span(b.x0, b.x1) + ", y " + span(b.y0, b.y1) + ") is over: \"" +
+                                (t.length > 400 ? t.slice(0, 400) + "…" : t) + "\"");
+            }
+        });
+        return out;
+    }
+
+    // Done on a reading page: the agent writes the digest of the notes
+    function doneReading() {
+        if (!readingPage || busy) return;
+        ask({ done: true });
+    }
+
+    function sendDigest(md) {
+        const id = pageId;
+        setPageState(id, "done");
+        server("POST", "/v1/inbox/" + id, { digest: md }, (st) => {
+            if (st !== 200) status = "The digest is on the page, but not on the server yet: " + (unreachable(st) || "HTTP " + st);
+        });
+    }
+
     // ---- the user layer
 
     function penDown(x, y) {
         inking = true;
         lastPen = Date.now();
         inkIdle.stop();
-        pauseTimer.stop();
         // the page never moves under the pen
         roomTimer.stop();
         scrollAnim.stop();
@@ -462,11 +662,6 @@ Rectangle {
                 Ink.drop(s);
                 inkLayer.redrawBox(s);
                 continueWeb(tick);
-            } else if (s && sendMode === "mark" && Ink.isCheck(s) && Ink.pending().length > 1) {
-                Ink.drop(s);
-                inkLayer.redrawBox(s);
-                strokeCount = Ink.pending().length;
-                ask();
             }
             if (s && Ink.strokes.indexOf(s) >= 0) {
                 lassoLast = false;
@@ -477,7 +672,6 @@ Rectangle {
         updateBottom();
         scheduleSave();
         inkIdle.restart();
-        if (sendMode === "pause" && strokeCount > 0 && !busy) pauseTimer.restart();
     }
 
     // The digitizer says which end is in range (backend message 101). It can
@@ -508,6 +702,9 @@ Rectangle {
             const px = a.x + (x - a.x) * i / n, py = a.y + (y - a.y) * i / n;
             const b = Ink.erase(px, py, 16, skip);
             if (b) inkLayer.redrawBox(b);
+            // a var property reads back as a copy: push() on it is lost
+            const gone = Ink.lastErased.filter(s => s.turn >= 0).map(s => ({ x0: s.x0, y0: s.y0, x1: s.x1, y1: s.y1 }));
+            if (gone.length) erasedSince = erasedSince.concat(gone);
             if (showType) eraseWordsAt(px, py);
         }
         lastErase = { x: x, y: y };
@@ -568,6 +765,7 @@ Rectangle {
     }
 
     function undoStroke() {
+        if (askArmed) { disarmAsk(); return; }
         if (lassoLast && Ink.lasso) { clearLasso(); return; }
         inkLayer.redrawBox(Ink.undo());
         refreshTyped();
@@ -616,25 +814,42 @@ Rectangle {
 
     // ---- the lasso
 
-    function toggleLasso() {
-        if (lassoMode) {
-            lassoMode = false;
-            clearLasso();
-            status = "";
-            return;
-        }
-        lassoMode = true;
+    // Ask, once: the next stroke is a loop, and the loop is the request
+    function armAsk() {
+        if (busy || exporting) return;
         eraser = false;
-        status = "Lasso: draw a loop with the pen round the part of the page to ask about.";
+        askArmed = true;
+        lassoMode = true;
+        status = "Circle what you mean, or tap Whole page.";
+    }
+
+    function disarmAsk() {
+        askArmed = false;
+        lassoMode = false;
+        if (Ink.loop) inkLayer.redrawBox(Ink.loop);
+        status = "";
+    }
+
+    // Ask, twice: the request is the whole page
+    function askWholePage() {
+        askArmed = false;
+        lassoMode = false;
+        clearLasso();
+        ask({ whole: true });
+    }
+
+    // the new strokes the loop l holds: most of their points inside it
+    function inkInLoop(l) {
+        return Ink.pending().filter(s => s.p.filter(p => Ink.inside(l, p.x, p.y)).length * 2 >= s.p.length);
     }
 
     function endLasso() {
         const live = Ink.loop, l = Ink.loopEnd();
         if (live) inkLayer.redrawBox(live);
-        if (!l) return;  // a tap: still in lasso mode
-        const n = lassoed(l, Ink.regions(Ink.strokes, 60)).length;
+        if (!l) return;  // a tap: still armed
+        const n = lassoed(l, Ink.regions(Ink.strokes, 60)).length + inkInLoop(l).length;
         if (!n) {
-            status = "Nothing inside the loop. Draw it round your writing or a reply.";
+            status = "Nothing inside the loop. Draw it round your writing or a reply, or tap Whole page.";
             return;
         }
         const old = Ink.lasso;
@@ -642,10 +857,9 @@ Rectangle {
         if (old) inkLayer.redrawBox(old);
         inkLayer.redrawBox(l);
         lassoId = l.id;
+        askArmed = false;
         lassoMode = false;
-        lassoLast = true;
-        status = "Lassoed " + (n > 1 ? n + " parts" : "one part") + " of the page. Now write your question about " + (n > 1 ? "them." : "it.");
-        scheduleSave();
+        ask({ loop: l });
     }
 
     function clearLasso() {
@@ -713,17 +927,31 @@ Rectangle {
     // for the tests
     function lassoParts() { return Ink.lasso ? lassoed(Ink.lasso, Ink.regions(Ink.strokes, 60)) : []; }
 
-    // the lasso in the request
-    function lassoText(ls) {
-        if (!ls) return "";
+    // what the user asks: a loop round part of the page, or the whole page
+    function requestText(ctx) {
+        if (ctx.request === "done") {
+            const doc = docText(), marks = docMarks(ctx);
+            return "The request: the user finished reading \"" + currentPage.title + "\" (" + (currentPage.from ? "sent from " + currentPage.from : "sent to read") +
+                   ") and tapped Done. Write the digest of their notes in `digest`, in Markdown, for them to read back at the computer: " +
+                   "a short summary of what they thought; their decisions, questions and to-dos as lists; and each mark with the " +
+                   "passage it covers and their note. Only what they wrote: add nothing of your own, and put no other items on the page.\n\n" +
+                   "Their marks over the document:\n" + (marks.join("\n") || "(none)") + "\n\n" +
+                   "The document:\n" + (doc.length > 30000 ? doc.slice(0, 30000) + "\n… (cut)" : doc);
+        }
+        const ls = ctx.lasso;
+        if (!ls) return "The request: the user tapped Whole page. Look at the whole page (the page map, the conversation " +
+                        "and the images) and answer what the new ink asks; with no new ink, respond to the page as a whole.";
         const b = ls.box;
         const lines = ls.parts.slice(0, 16).map(e => "- " + e.id + ": " + e.what + ", x " + span(e.box.x0, e.box.x1) +
             ", y " + span(e.box.y0, e.box.y1) +
             (e.part ? " (partly: the loop holds x " + span(e.part.x0, e.part.x1) + ", y " + span(e.part.y0, e.part.y1) + " of it)" : "") + ": " +
             (e.text ? "\"" + (e.text.length > 800 ? e.text.slice(0, 800) + "…" : e.text) + "\"" : e.none));
-        return "Lasso: the user drew a loop round part of the page, x " + span(b.x0, b.x1) + ", y " + span(b.y0, b.y1) +
-               ". The new handwriting is a question about just that part: answer about what is inside the loop. Inside it:\n" +
-               (lines.join("\n") || "(nothing)") + "\n\n";
+        const q = ls.asked;
+        return "The request: the user drew a loop, x " + span(b.x0, b.x1) + ", y " + span(b.y0, b.y1) + ". What it holds is the request; " +
+               "the rest of the page is context. " +
+               (q ? "The new ink inside it, x " + span(q.x0, q.x1) + ", y " + span(q.y0, q.y1) + ", is the question, about the rest of what it holds. "
+                  : "It holds no new ink: tell the user about what it holds. ") +
+               "Place your answer below the loop. The loop holds:\n" + (lines.join("\n") || "(nothing earlier: only the new ink)");
     }
 
     function lassoStyle(ctx) {
@@ -746,19 +974,9 @@ Rectangle {
         ctx.stroke();
     }
 
-    property var lastTap: null
+    // a finger tap on the page cancels an armed Ask
     function fingerTap(x, y) {
-        if (sendMode !== "double") return;
-        const now = Date.now();
-        const t = lastTap;
-        if (t && now - t.time < 500 && Math.abs(x - t.x) + Math.abs(y - t.y) < 80 && t.cy === page.contentY) {
-            lastTap = null;
-            tapSentAt = now;
-            wordTap.stop();
-            ask();
-        } else {
-            lastTap = { time: now, x: x, y: y, cy: page.contentY };
-        }
+        if (askArmed) disarmAsk();
     }
 
     function inkStyle(ctx) {
@@ -909,16 +1127,10 @@ Rectangle {
         return Ink.readingOrder(out);
     }
 
-    // tapping a word opens the rewrite pad (after a pause in double tap mode,
-    // where the tap may be the first of two)
+    // tapping a word opens the rewrite pad; with Ask armed, it cancels it
     function tapWord(k) {
-        if (Date.now() - tapSentAt < 700) return;
-        if (sendMode === "double") {
-            pendingWord = k;
-            wordTap.restart();
-        } else {
-            openFix(k);
-        }
+        if (askArmed) { disarmAsk(); return; }
+        openFix(k);
     }
 
     function openFix(k) {
@@ -1172,6 +1384,21 @@ Rectangle {
     property var exportGrab: null
     property var lastImages: []
 
+    // regions as at most n full-width boxes, the closest ones merged, each at
+    // most 1600 px tall
+    function mergeBoxes(regions, n) {
+        const out = regions.map(r => ({ y0: Math.max(0, r.y0 - 24), y1: r.y1 + 24 })).sort((a, b) => a.y0 - b.y0);
+        for (let k = out.length - 2; k >= 0; k--)
+            if (out[k + 1].y0 <= out[k].y1) { out[k].y1 = Math.max(out[k].y1, out[k + 1].y1); out.splice(k + 1, 1); }
+        while (out.length > n) {
+            let k = 0;
+            for (let j = 1; j < out.length - 1; j++) if (out[j + 1].y0 - out[j].y1 < out[k + 1].y0 - out[k].y1) k = j;
+            out[k].y1 = out[k + 1].y1;
+            out.splice(k + 1, 1);
+        }
+        return out.map(b => ({ x: 0, y: Math.round(b.y0), w: pageWidth, h: Math.round(Math.min(1600, b.y1 - b.y0)) }));
+    }
+
     // the parts of the page around the new ink: full width, a little above
     // and below each group of it, at most three
     function pageBoxes(pend) {
@@ -1195,18 +1422,27 @@ Rectangle {
                                h: Math.round(b.y1 - Math.max(b.y0, b.y1 - 2400)) }));
     }
 
-    function ask() {
-        if (busy || (strokeCount === 0 && !chosenLink) || exporting) return;
+    // The request (docs/DESIGN.md): { loop: L }, what a loop holds, or
+    // { whole: true }, the whole page (also what ask() alone means). It needs
+    // no new ink: a loop round an old reply is a request too.
+    function ask(req) {
+        if (busy || exporting) return;
         if (!apiKey || !baseUrl) { loadConfig(); return; }
+        const L = req && req.loop ? req.loop : null;
         busy = true;
         asks++;
-        pauseTimer.stop();
+        askArmed = false;
         askCtx = context();
+        askCtx.erased = erasedSince;
+        erasedSince = [];
         refreshBuilds();
         askCtx.links = markedLinks(askCtx.sent);
         askCtx.marks = markedText(askCtx.sent);
-        const L = Ink.lasso;
-        askCtx.lasso = L ? { id: L.id, box: { x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1 }, parts: lassoed(L, askCtx.regions) } : null;
+        askCtx.request = req && req.done ? "done" : L ? "loop" : "whole";
+        askCtx.lasso = L ? { id: L.id, box: { x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1 }, parts: lassoed(L, askCtx.regions),
+                             asked: Ink.box(inkInLoop(L)) } : null;
+        // the answer goes below the loop
+        if (L) askCtx.newest = { x0: L.x0, y0: L.y0, x1: L.x1, y1: L.y1, turn: -1, last: -1 };
         const tapped = chosenLink;
         chosenLink = null;
         if (tapped) {
@@ -1217,22 +1453,35 @@ Rectangle {
                 askCtx.newest = { x0: it.px, y0: it.py, x1: it.px + it.pw, y1: it.py + it.ph, turn: -1, last: -1 };
             }
         }
+        // ink only: grabToImage of the replies crashes xochitl ("Layers are
+        // not supported"), and a crash loop reboots the tablet
         const jobs = [];
         const b = askCtx.box;
         if (b) {
             const x0 = Math.max(0, Math.floor(b.x0 - 24)), y0 = Math.max(0, Math.floor(b.y0 - 24));
-            jobs.push({ ink: true, strokes: askCtx.sent,
+            jobs.push({ ink: true, fresh: true, strokes: askCtx.sent,
                         box: { x: x0, y: y0, w: Math.min(pageWidth, Math.ceil(b.x1 + 24)) - x0, h: Math.ceil(b.y1 + 24) - y0 } });
-            // ink only: grabToImage of the replies crashes xochitl ("Layers
-            // are not supported"), and a crash loop reboots the tablet
             for (const pb of pageBoxes(askCtx.sent)) jobs.push({ ink: true, box: pb, strokes: Ink.strokes.slice() });
-            // what the question is about: the ink in the loop, and the loop
-            if (L) {
-                const lx = Math.max(0, Math.floor(L.x0 - 24)), ly = Math.max(0, Math.floor(L.y0 - 24));
-                jobs.push({ ink: true, loop: L, strokes: Ink.strokes.slice(),
-                            box: { x: lx, y: ly, w: Math.min(pageWidth, Math.ceil(L.x1 + 24)) - lx,
-                                   h: Math.min(2400, Math.ceil(L.y1 + 24) - ly) } });
-            }
+        }
+        // what the request is about: the ink in the loop, and the loop
+        if (L) {
+            const lx = Math.max(0, Math.floor(L.x0 - 24)), ly = Math.max(0, Math.floor(L.y0 - 24));
+            jobs.push({ ink: true, loop: L, strokes: Ink.strokes.slice(),
+                        box: { x: lx, y: ly, w: Math.min(pageWidth, Math.ceil(L.x1 + 24)) - lx,
+                               h: Math.min(2400, Math.ceil(L.y1 + 24) - ly) } });
+        } else if (askCtx.request === "done") {
+            // Done: every mark and note on the document
+            askCtx.newest = { x0: 0, y0: pageBottom, x1: pageWidth, y1: pageBottom, turn: -1, last: -1 };
+            for (const ub of mergeBoxes(askCtx.regions, 6)) jobs.push({ ink: true, strokes: Ink.strokes.slice(), box: ub });
+        } else {
+            // the whole page: the ink the agent has not read yet, small
+            const unread = askCtx.regions.filter(r => r.turn >= 0 && !regionText(r));
+            for (const ub of mergeBoxes(unread, 3)) jobs.push({ ink: true, unread: true, strokes: Ink.strokes.slice(), box: ub });
+        }
+        if (!L && !b && !jobs.length && Ink.strokes.length) {
+            // the whole page with no new ink: the screen as the user sees it
+            const y = Math.round(page.contentY);
+            jobs.push({ ink: true, screen: true, strokes: Ink.strokes.slice(), box: { x: 0, y: y, w: pageWidth, h: Math.round(Math.min(page.height, 2400)) } });
         }
         askCtx.jobs = jobs;
         status = "Sending…";
@@ -1321,15 +1570,26 @@ Rectangle {
     function span(a, b) { return Math.round(a) + "–" + Math.round(b); }
 
     // the page map: regions near the new ink, with their ids
+    // what the agent knows of an ink region: its text, or what it saw there
+    function regionText(r) {
+        if (r.turn < 0) return "";
+        const words = typedIn(r);
+        if (words.length) return "text: \"" + words.map(w => w.text).join(" ").slice(0, 160) + "\"";
+        const d = Ink.described(r);
+        return d ? "seen as: " + d.slice(0, 160) : "";
+    }
+
+    // the whole page, top to bottom: every ink region and item, with what
+    // the agent knows of each (at most 200 lines, nearest the request first)
     function pageMap(ctx) {
-        const near = ctx.box ? (ctx.box.y0 + ctx.box.y1) / 2 : pageBottom;
+        const near = ctx.newest ? (ctx.newest.y0 + ctx.newest.y1) / 2 : ctx.box ? (ctx.box.y0 + ctx.box.y1) / 2 : pageBottom;
         const all = [];
         ctx.regions.forEach((r, k) => {
-            const words = r.turn < 0 ? [] : typedIn(r);
+            const known = regionText(r);
             all.push({ y: r.y0, d: Math.abs((r.y0 + r.y1) / 2 - near),
                 line: "i" + (k + 1) + ": ink" + (r.turn < 0 ? " (new)" : ", turn " + (r.turn + 1)) +
                       ", x " + span(r.x0, r.x1) + ", y " + span(r.y0, r.y1) +
-                      (words.length ? ", shown as type: \"" + words.map(w => w.text).join(" ").slice(0, 120) + "\"" : "") });
+                      (known ? ", " + known : r.turn >= 0 ? ", not read yet" : "") });
         });
         for (let i = 0; i < items.count; i++) {
             const it = items.get(i);
@@ -1339,13 +1599,32 @@ Rectangle {
                 line: "c" + i + ": your " + it.kind + " (" + it.place + (it.turn >= 0 ? ", turn " + (it.turn + 1) : "") + "), x " +
                       span(it.px, it.px + it.pw) + ", y " + span(it.py, it.py + it.ph) + ": " + text });
         }
-        const kept = all.sort((a, b) => a.d - b.d).slice(0, 40).sort((a, b) => a.y - b.y);
+        const kept = all.sort((a, b) => a.d - b.d).slice(0, 200).sort((a, b) => a.y - b.y);
         return kept.map(e => "- " + e.line).join("\n");
     }
 
+    // what changed since the agent's last answer
+    function changesText(ctx) {
+        const lines = [];
+        ctx.regions.forEach((r, k) => {
+            if (r.turn < 0) lines.push("- new ink i" + (k + 1) + " at x " + span(r.x0, r.x1) + ", y " + span(r.y0, r.y1));
+        });
+        const over = [];
+        for (let i = 0; i < items.count; i++) {
+            const it = items.get(i);
+            if (ctx.sent.some(s => s.x1 > it.px && s.x0 < it.px + it.pw && s.y1 > it.py && s.y0 < it.py + it.ph)) over.push("c" + i);
+        }
+        if (over.length) lines.push("- the new ink touches your items " + over.join(", ") + " (a mark on them: see the images)");
+        const gone = Ink.regions(ctx.erased.map(b => ({ x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, turn: 0, p: [] })), 60);
+        for (const b of gone.slice(0, 12)) lines.push("- the user erased earlier ink at x " + span(b.x0, b.x1) + ", y " + span(b.y0, b.y1));
+        return "Since your last answer:\n" + (lines.join("\n") || "- nothing changed") + "\n\n";
+    }
+
     function transcript() {
-        let s = "";
-        for (let t = Math.max(0, turns.count - historyTurns); t < turns.count; t++) {
+        const from = Math.max(0, turns.count - historyTurns);
+        // the older turns: the agent's own summary of them
+        let s = from > 0 && pageSummary ? "Your summary of the page and of turns 1 to " + from + ":\n" + pageSummary + "\n\n" : "";
+        for (let t = from; t < turns.count; t++) {
             let replies = "";
             for (let i = 0; i < items.count; i++) {
                 const it = items.get(i);
@@ -1364,34 +1643,40 @@ Rectangle {
     function send(pngs) {
         const ctx = askCtx;
         const history = transcript();
-        const ink = ctx.jobs.length ? ctx.jobs[0].box : null;
         const content = [{ type: "text", text:
             (history ? "The conversation so far:\n\n" + history : "This is the first message on the page.\n\n") +
             "The page is " + pageWidth + " px wide and " + Math.round(Math.max(pageBottom, page.height)) +
             " px tall so far; the user sees y " + span(page.contentY, page.contentY + page.height) + ".\n" +
             "Page map:\n" + (pageMap(ctx) || "(empty)") + "\n\n" +
             linkText(ctx.links, ctx.marks) +
-            lassoText(ctx.lasso) +
             failedText() +
             "Recent builds of app changes, newest first:\n" + (buildStatus() || "(none)") + "\n\n" +
             selfReport() +
             "Pieces of the new ink, for `typeset`:\n" + (pieceList(ctx) || "(none)") + "\n\n" +
-            (ink ? "Image 1: the user's new ink alone, the page box x " + span(ink.x, ink.x + ink.w) +
-                   ", y " + span(ink.y, ink.y + ink.h) + " (1 image px = 1 page px)." +
-                   (ctx.newest ? " The newest ink is at x " + span(ctx.newest.x0, ctx.newest.x1) + ", y " + span(ctx.newest.y0, ctx.newest.y1) + "." : "")
-                 : "There is no new ink: the user tapped a link and then Ask.")
+            (ctx.box ? "The new ink is at x " + span(ctx.box.x0, ctx.box.x1) + ", y " + span(ctx.box.y0, ctx.box.y1) + ".\n\n"
+                     : "There is no new ink since your last answer.\n\n") +
+            changesText(ctx) +
+            requestText(ctx)
         }];
-        if (pngs.length) content.push({ type: "image", source: { type: "base64", media_type: "image/png", data: pngs[0] } });
-        for (let k = 1; k < pngs.length; k++) {
-            const b = ctx.jobs[k].box;
-            content.push({ type: "text", text: ctx.jobs[k].loop
-                ? "Image " + (k + 1) + ": the lassoed part of the page, x " + span(b.x, b.x + b.w) + ", y " + span(b.y, b.y + b.h) +
-                  ": the user's ink and the loop (dashed); your items are not drawn, their text is with the lasso above. " +
+        ctx.jobs.forEach((j, k) => {
+            if (k >= pngs.length) return;
+            const b = j.box, n = "Image " + (k + 1) + ": ";
+            content.push({ type: "text", text: j.fresh
+                ? n + "the user's new ink alone, the page box x " + span(b.x, b.x + b.w) + ", y " + span(b.y, b.y + b.h) + " (1 image px = 1 page px)."
+                : j.loop
+                ? n + "what the loop holds, x " + span(b.x, b.x + b.w) + ", y " + span(b.y, b.y + b.h) +
+                  ": the user's ink and the loop (dashed); your items are not drawn, their text is in the request. " +
                   "Image x 0, y 0 is page x " + b.x + ", y " + b.y + "."
-                : "Image " + (k + 1) + ": the page from y " + span(b.y, b.y + b.h) +
-                  ", full width, the user's ink only (your replies are not drawn; their text is in the conversation). Image y 0 is page y " + b.y + "." });
+                : j.unread
+                ? n + "ink you have not read yet, y " + span(b.y, b.y + b.h) + ", full width, the user's ink only. Image y 0 is page y " + b.y +
+                  ". Say in `seen` what each drawing or mark there is, so you need not look again."
+                : j.screen
+                ? n + "the screen as the user sees it, y " + span(b.y, b.y + b.h) + ", the user's ink only (your replies are not drawn; " +
+                  "their text is in the conversation). Image y 0 is page y " + b.y + "."
+                : n + "the page from y " + span(b.y, b.y + b.h) + ", full width, the user's ink only (your replies are not drawn; " +
+                  "their text is in the conversation). Image y 0 is page y " + b.y + "." });
             content.push({ type: "image", source: { type: "base64", media_type: "image/png", data: pngs[k] } });
-        }
+        });
         const p = { id: "", started: Date.now(), who: models[modelIndex].label + ", " + efforts[effortIndex].id, ctx: ctx,
                     calls: [], base: { content: content, model: models[modelIndex].id, effort: efforts[effortIndex].id, system: fullSystemPrompt() } };
         // for a reopened app that must send the live calls' results
@@ -1512,6 +1797,8 @@ Rectangle {
     property var pending: null
 
     function failed(why) {
+        // what was erased goes with the next ask instead
+        if (askCtx && askCtx.erased && askCtx.erased.length) { erasedSince = askCtx.erased.concat(erasedSince); askCtx.erased = []; }
         busy = false;
         pending = null;
         askPoll.stop();
@@ -1575,9 +1862,6 @@ Rectangle {
             status = "Failed: " + String(e) + " The ink is kept: ask again.";
         }
         scheduleSave();
-        // ink written while the assistant was busy; after a failure, only new ink
-        // or Ask sends again
-        if (ok && sendMode === "pause" && strokeCount > 0) pauseTimer.restart();
     }
 
     // Runs the assistant's live calls (at most webCalls in all), then asks
@@ -1662,6 +1946,7 @@ Rectangle {
 
     function webLabel(it) {
         const n = it.parts > 1 ? ", part " + (it.part + 1) + " of " + it.parts : it.part > 0 ? ", part " + (it.part + 1) : "";
+        if (it.url.indexOf("folio:doc/") === 0) return "the document \"" + it.title + "\" the user reads (" + it.site + ")" + n;
         return "web page \"" + it.title + "\", " + it.url + (it.mode === "screenshot" ? ", a screenshot" : ", reader view") + n +
                (it.webState === "more" ? ", with more to continue" : "");
     }
@@ -1884,8 +2169,7 @@ Rectangle {
         if (!href || i < 0 || i >= items.count) return;
         const text = linkTitle(items.get(i), href);
         chosenLink = { item: i, href: href, text: text };
-        status = "Link: “" + text + "” (" + Net.shortUrl(href) + "). Tap Ask to open it, or write what to do with it.";
-        if (sendMode === "pause" && !busy) pauseTimer.restart();
+        status = "Link: “" + text + "” (" + Net.shortUrl(href) + "). Tap Ask twice to open it, or write what to do with it and circle that.";
     }
 
     function linksOf(it) {
@@ -1975,7 +2259,9 @@ Rectangle {
         if (!job || greyPad.job) return;
         const have = Net.images[job.src];
         if (have && have.data) { finishGrey(have); return; }
-        webGet(job.src, { binary: true, timeout: job.opts.timeout || 20000, max: 3e6 }, (err, r) => {
+        // the pages of a PDF sent to read come from the server, with its token
+        const own = job.src.indexOf(serverUrl + "/") === 0 ? { "x-api-key": serverToken } : undefined;
+        webGet(job.src, { binary: true, timeout: job.opts.timeout || 20000, max: 3e6, headers: own }, (err, r) => {
             if (Net.greyQueue[0] !== job) return;
             if (err) { finishGrey({ error: err }); return; }
             const type = r.type.split(";")[0].trim();
@@ -2005,7 +2291,8 @@ Rectangle {
             sent: ctx.sent.map(idx),
             box: ctx.box,
             newest: ctx.newest,
-            lasso: ctx.lasso ? { id: ctx.lasso.id } : null,
+            lasso: ctx.lasso ? { id: ctx.lasso.id, box: ctx.lasso.box } : null,
+            request: ctx.request || "",
             pieces: (ctx.pieces || []).map(p => Object.assign({}, p, { strokes: p.strokes.map(idx) }))
         };
     }
@@ -2019,11 +2306,14 @@ Rectangle {
             box: c.box,
             newest: c.newest,
             lasso: c.lasso || null,
+            request: c.request || "",
             pieces: (c.pieces || []).map(p => Object.assign({}, p, { strokes: (p.strokes || []).map(ref).filter(ok) }))
         };
     }
 
     Timer { id: askPoll; interval: 3000; repeat: true; onTriggered: root.pollAsk() }
+    // what was sent to read
+    Timer { interval: 300000; running: true; repeat: true; onTriggered: root.refreshInbox() }
     Timer { id: postRetry; property var p: null; onTriggered: root.postJob(p) }
 
     // puts a reply on the page; true when the assistant changed its notes
@@ -2031,7 +2321,7 @@ Rectangle {
         const t = turns.count;
         for (const s of ctx.sent) s.turn = t;
         strokeCount = Ink.pending().length;
-        const b = ctx.box || { y0: pageBottom, y1: pageBottom };
+        const b = ctx.box || (ctx.lasso && ctx.lasso.box) || { y0: pageBottom, y1: pageBottom };
         turns.append({ heard: String(input.heard || ""), y0: b.y0, y1: b.y1 });
         const specs = Array.isArray(input.items) ? input.items.slice() : [];
         if (input.answer) specs.push({ kind: "markdown", content: input.answer, place: "below" });
@@ -2044,6 +2334,13 @@ Rectangle {
                          changeNote: tooLong ? "This request is cut off: it is longer than " + changeChars + " characters. Ask for a shorter one before you build it."
                                    : input.cut ? cutNote : !endsWhole(change) ? "This request may be cut off: it ends mid-sentence. Ask again before you build it." : "" });
         }
+        // the digest of a reading goes below everything, and to the computer
+        const digest = ctx.request === "done" ? String(input.digest || "").trim() : "";
+        if (digest) {
+            specs.length = 0;
+            specs.push({ kind: "markdown", content: "## Your notes\n\n" + digest, place: "below" });
+            sendDigest(digest);
+        }
         const state = { cursor: (ctx.newest ? ctx.newest.y1 : pageBottom) + margin };
         // what comes before the first web item shows at once
         const w = specs.findIndex(s => s && s.kind === "web");
@@ -2051,6 +2348,13 @@ Rectangle {
         if (w < 0) dropLasso(ctx);
         else placeLater(specs.slice(w), ctx, t, state.cursor);
         if (ctx.pieces) convertLater(input.typeset, ctx);
+        // read once: what it saw in ink that is no text stays on the strokes
+        for (const e of Array.isArray(input.seen) ? input.seen : []) {
+            const k = /^i(\d+)$/.test(String(e && e.id)) ? +String(e.id).slice(1) - 1 : -1;
+            const r = ctx.regions && ctx.regions[k];
+            if (r && String(e.text || "").trim()) Ink.describe(Object.assign({}, r, { turn: r.turn < 0 ? t : r.turn }), String(e.text).trim().slice(0, 300));
+        }
+        if (String(input.summary || "").trim()) pageSummary = String(input.summary).trim().slice(0, 3000);
         let noted = false;
         const newNotes = String(input.notes || "");
         if (newNotes.trim() && newNotes !== notes) {
@@ -2376,12 +2680,10 @@ Rectangle {
         onTriggered: root.pollChanges()
     }
     Timer { id: saveTimer; interval: 2000; onTriggered: root.savePage() }
-    Timer { id: pauseTimer; interval: root.pauseSecs * 1000; onTriggered: root.ask() }
     // back to the grey-faithful screen mode once the pen rests
     Timer { id: inkIdle; interval: 1500; onTriggered: root.inking = false }
     Timer { id: newTimeout; interval: 4000; onTriggered: root.confirmNew = false }
     Timer { id: typingTimer; onTriggered: root.flushTyping() }
-    Timer { id: wordTap; interval: 450; onTriggered: root.openFix(root.pendingWord) }
     Timer { id: roomTimer; interval: root.roomDelay; onTriggered: root.makeRoom() }
     NumberAnimation { id: scrollAnim; target: page; property: "contentY"; duration: 400; easing.type: Easing.OutCubic }
 
@@ -2391,7 +2693,7 @@ Rectangle {
         loadNotes();
         checkLatest();
         refreshBuilds();
-        loadPage();
+        loadPages(() => loadPage());
     }
     // also when the app goes without unloading(), as when the loader swaps versions
     Component.onDestruction: Net.closeAll()
@@ -2459,6 +2761,18 @@ Rectangle {
             return out.map(l => ({ href: l.href, x0: Math.round(l.x0), y0: Math.round(l.y0), x1: Math.round(l.x1), y1: Math.round(l.y1) }));
         }
         // the page's text under the box (page px): what the ink marks
+        // the pictures in a web item, as page boxes: { src, x, y, w, h }
+        function imageBoxes() {
+            const out = [];
+            for (let k = 0; k < webBlocks.count; k++) {
+                const b = webBlocks.itemAt(k);
+                if (!b || !b.img || !b.size || !b.size.w) continue;
+                const p = b.mapToItem(ci, 0, 0), w = Math.min(b.width, b.size.w);
+                out.push({ src: b.img, x: x + p.x, y: y + p.y, w: w, h: w * b.size.h / b.size.w });
+            }
+            return out;
+        }
+
         function textIn(x0, y0, x1, y1) {
             const out = [];
             for (let k = 0; k < webBlocks.count; k++) {
@@ -2498,7 +2812,7 @@ Rectangle {
             }
             Text {
                 width: parent.width
-                text: (ci.site && ci.site !== Net.hostOf(ci.url) ? ci.site + " · " : "") + Net.shortUrl(ci.url) +
+                text: ci.url.indexOf("folio:doc/") === 0 ? ci.site + (ci.parts > 1 ? " · part " + (ci.part + 1) + " of " + ci.parts : "") : (ci.site && ci.site !== Net.hostOf(ci.url) ? ci.site + " · " : "") + Net.shortUrl(ci.url) +
                       (ci.mode === "screenshot" ? " · screenshot" : "") +
                       (ci.parts > 1 ? " · part " + (ci.part + 1) + " of " + ci.parts : ci.part > 0 ? " · part " + (ci.part + 1) : "")
                 font.pixelSize: 22
@@ -2514,6 +2828,7 @@ Rectangle {
                     readonly property var text: modelData.img ? null : blockText
                     readonly property bool hasLinks: !modelData.img && modelData.md.indexOf("](") >= 0
                     readonly property var size: modelData.img ? ci.dims[modelData.img] || { w: 0, h: 0 } : null
+                    readonly property string img: modelData.img || ""
                     width: webCol.width
                     height: modelData.img ? pic.height : blockText.height
                     // a TextEdit, not a Text: it tells where each character
@@ -2590,8 +2905,9 @@ Rectangle {
                 }
             }
             Text {
-                visible: ci.webState === "continued" || ci.webState === "end"
-                text: ci.webState === "continued" ? "Continued below" : "End of the page"
+                readonly property bool doc: ci.url.indexOf("folio:doc/") === 0
+                visible: ci.webState === "continued" || ci.webState === "end" && (!doc || ci.part === ci.parts - 1)
+                text: ci.webState === "continued" ? "Continued below" : doc ? "End of the document" : "End of the page"
                 font.pixelSize: 22
                 font.italic: true
                 color: "#555555"
@@ -2705,23 +3021,17 @@ Rectangle {
             BarButton { width: root.barCell;
                 id: askButton
                 objectName: "askButton"
-                label: root.busy ? "…" : "Ask"
+                label: root.busy ? "…" : root.askArmed ? "Whole page" : "Ask"
                 primary: true
-                enabledState: (root.strokeCount > 0 || root.chosenLink !== null) && !root.busy
-                onClicked: root.ask()
+                enabledState: !root.busy && !root.exporting
+                onClicked: root.askArmed ? root.askWholePage() : root.armAsk()
             }
             BarButton { width: root.barCell; objectName: "undoButton"; label: "Undo"; enabledState: !root.busy; onClicked: root.undoStroke() }
             BarButton { width: root.barCell;
                 objectName: "eraserButton"
                 label: "Erase"
                 primary: root.erasingTool
-                onClicked: { root.eraser = !root.eraser; if (root.eraser) root.lassoMode = false; }
-            }
-            BarButton { width: root.barCell;
-                objectName: "lassoButton"
-                label: "Lasso"
-                primary: root.lassoMode
-                onClicked: root.toggleLasso()
+                onClicked: { root.eraser = !root.eraser; if (root.eraser && root.askArmed) root.disarmAsk(); }
             }
             BarButton { width: root.barCell;
                 objectName: "moreButton"
@@ -3015,12 +3325,103 @@ Rectangle {
         anchors.fill: page
         displayMethod: root.inking ? DisplayMethodArea.UFast : DisplayMethodArea.Content
     }
+    // where you are, and what waits to be read: shown once there is more than
+    // one page. A tap opens Pages
+    Rectangle {
+        id: titleRow
+        objectName: "titleRow"
+        anchors { left: page.left; right: page.right; top: page.top }
+        height: visible ? 60 : 0
+        visible: root.pagesIndex.length > 1 && !root.notesOpen && !root.activityOpen && !root.pagesOpen
+        color: "white"
+        z: 3
+        Rectangle { anchors { bottom: parent.bottom; left: parent.left; right: parent.right } height: 1; color: "#bbbbbb" }
+        Text {
+            id: titleText
+            anchors { left: parent.left; leftMargin: 36; verticalCenter: parent.verticalCenter }
+            width: Math.min(implicitWidth, titleRight.x - 36 - 60)
+            text: root.currentPage.title
+            elide: Text.ElideRight
+            font.pixelSize: 26
+            font.bold: true
+        }
+        // the tablet's fonts have no arrows: drawn
+        Canvas {
+            anchors { left: titleText.right; leftMargin: 14; verticalCenter: parent.verticalCenter }
+            width: 22
+            height: 14
+            onPaint: {
+                const ctx = getContext("2d");
+                ctx.strokeStyle = "black";
+                ctx.lineWidth = 3;
+                ctx.lineCap = "round";
+                ctx.lineJoin = "round";
+                ctx.beginPath();
+                ctx.moveTo(3, 3); ctx.lineTo(11, 11); ctx.lineTo(19, 3);
+                ctx.stroke();
+            }
+        }
+        MouseArea { anchors.fill: parent; onClicked: { root.pagesOpen = true; root.refreshInbox(); } }
+        Row {
+            id: titleRight
+            anchors { right: parent.right; verticalCenter: parent.verticalCenter }
+            // beside the tab of the hidden toolbar
+            anchors.rightMargin: root.barShown ? 24 : 24 + barTab.width + 16
+            spacing: 12
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.toRead > 0
+                text: root.toRead + " to read"
+                font.pixelSize: 24
+                color: "#444444"
+            }
+            Rectangle {
+                objectName: "doneButton"
+                visible: root.readingPage && root.currentPage.state !== "done"
+                width: doneText.implicitWidth + 44
+                height: 48
+                radius: 24
+                color: root.busy ? "white" : "black"
+                border.color: "black"
+                border.width: 2
+                Text {
+                    id: doneText
+                    anchors.centerIn: parent
+                    text: root.busy ? "…" : "Done"
+                    font.pixelSize: 24
+                    font.bold: true
+                    color: root.busy ? "black" : "white"
+                }
+                MouseArea { anchors.fill: parent; anchors.margins: -8; onClicked: root.doneReading() }
+            }
+        }
+    }
+
+    // on a reading page, a finger tap at the top or bottom edge turns a
+    // screen (scrolling is slow on e-ink); the pen writes through
+    component EdgeTap: MouseArea {
+        property int dir: 1
+        visible: root.readingPage && !root.notesOpen && !root.activityOpen && !root.pagesOpen
+        z: 2
+        property real y0: 0
+        onPressed: mouse => {
+            if (mouse.source === Qt.MouseEventNotSynthesized) { mouse.accepted = false; return; }
+            y0 = mouse.y;
+        }
+        onReleased: mouse => {
+            if (Math.abs(mouse.y - y0) > 24 || root.askArmed) return;
+            root.scrollTo(page.contentY + dir * page.height * 0.8, false);
+        }
+    }
+    EdgeTap { objectName: "edgeUp"; dir: -1; anchors { left: page.left; right: page.right; top: titleRow.bottom } height: page.height * 0.12 }
+    EdgeTap { objectName: "edgeDown"; dir: 1; anchors { left: page.left; right: page.right; bottom: page.bottom } height: page.height * 0.12 }
+
 
     Rectangle {
         id: statusStrip
         objectName: "statusStrip"
         // at the top, under the toolbar: the bottom of the page is for writing
-        anchors { left: page.left; right: page.right; top: page.top }
+        anchors { left: page.left; right: page.right; top: titleRow.visible ? titleRow.bottom : page.top }
         height: visible ? statusText.height + 16 : 0
         visible: root.status !== "" && !root.notesOpen
         color: "white"
@@ -3160,7 +3561,7 @@ Rectangle {
                     objectName: "newButton"
                     label: root.confirmNew ? "Tap again: clear the page" : "New page"
                     primary: root.confirmNew
-                    enabledState: !root.busy
+                    enabledState: !root.busy && !root.readingPage
                     onClicked: {
                         if (!root.confirmNew) { root.confirmNew = true; newTimeout.restart(); return; }
                         root.confirmNew = false;
@@ -3221,30 +3622,20 @@ Rectangle {
                     onClicked: { root.effortIndex = (root.effortIndex + 1) % root.efforts.length; root.saveSettings(); }
                 }
             }
+            SheetRule {}
+
             Row {
-                id: sendRow
                 spacing: 14
-                SheetTitle { text: "Send with" }
-                Button {
-                    objectName: "sendModeButton"
-                    label: root.sendModes.find(m => m.id === root.sendMode).label
-                    onClicked: {
-                        const i = root.sendModes.findIndex(m => m.id === root.sendMode);
-                        root.sendMode = root.sendModes[(i + 1) % root.sendModes.length].id;
-                        root.saveSettings();
-                    }
-                }
-                Button {
-                    visible: root.sendMode === "pause"
-                    label: root.pauseSecs + " s"
-                    onClicked: {
-                        const i = root.pauseChoices.indexOf(root.pauseSecs);
-                        root.pauseSecs = root.pauseChoices[(i + 1) % root.pauseChoices.length];
-                        root.saveSettings();
-                    }
+                SheetTitle { text: "Asking" }
+                Text {
+                    width: sheet.width - 264
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Tap Ask, then circle what you mean: the loop is the request. Tap Ask twice for the whole page. Nothing else is sent."
+                    wrapMode: Text.Wrap
+                    font.pixelSize: 24
+                    color: "#444444"
                 }
             }
-            SheetHelp { text: root.sendModes.find(m => m.id === root.sendMode).help + " The Ask button always works." }
             SheetRule {}
 
             Row {
@@ -3487,6 +3878,71 @@ Rectangle {
                 text: "No steps yet."
                 font.pixelSize: 24
                 color: "#666666"
+            }
+        }
+    }
+
+    // Pages: the conversation, then each reading, newest first
+    Rectangle {
+        id: pagesPanel
+        objectName: "pagesPanel"
+        anchors.fill: page
+        visible: root.pagesOpen
+        color: "white"
+        z: 7
+        MouseArea { anchors.fill: parent }
+
+        Text {
+            id: pagesTitle
+            anchors { top: parent.top; topMargin: 36; left: parent.left; leftMargin: 36 }
+            text: "Pages"
+            font.pixelSize: 38
+            font.bold: true
+        }
+        Button {
+            objectName: "pagesClose"
+            anchors { verticalCenter: pagesTitle.verticalCenter; right: parent.right; rightMargin: 36 }
+            label: "Close"
+            onClicked: root.pagesOpen = false
+        }
+        ListView {
+            id: pageList
+            objectName: "pageList"
+            anchors { top: pagesTitle.bottom; topMargin: 36; left: parent.left; leftMargin: 36; right: parent.right; rightMargin: 36; bottom: parent.bottom; bottomMargin: 24 }
+            clip: true
+            spacing: 14
+            boundsBehavior: Flickable.StopAtBounds
+            model: root.pagesIndex.slice(0, 1).concat(root.pagesIndex.slice(1).reverse())
+            delegate: Rectangle {
+                required property var modelData
+                width: pageList.width
+                height: pageCol.height + 28
+                radius: 12
+                border.color: modelData.id === root.pageId ? "black" : "#999999"
+                border.width: modelData.id === root.pageId ? 3 : 2
+                Column {
+                    id: pageCol
+                    x: 20
+                    y: 14
+                    width: parent.width - 40
+                    spacing: 4
+                    Text {
+                        width: parent.width
+                        text: modelData.title
+                        elide: Text.ElideRight
+                        font.pixelSize: 28
+                        font.bold: modelData.state === "new"
+                    }
+                    Text {
+                        width: parent.width
+                        text: modelData.kind === "main" ? "Your conversation with the assistant"
+                            : ({ new: "To read", reading: "Reading", done: "Done: your notes are at the computer" })[modelData.state] +
+                              (modelData.from ? " · from " + modelData.from : "")
+                        font.pixelSize: 22
+                        color: "#444444"
+                    }
+                }
+                MouseArea { anchors.fill: parent; onClicked: root.showPage(modelData.id) }
             }
         }
     }

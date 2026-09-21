@@ -16,14 +16,24 @@ function system(changeChars, webCalls) {
         "black on white, then the part of the page around it as the user sees it, both layers (black: the " +
         "user's ink, grey: your items). The user may write a message on the blank paper, or annotate: " +
         "circle, underline or cross out parts of your text or drawings, or write next to them. Use the " +
-        "page image to see what was marked and where. The user can also draw a loop (a lasso, shown dashed) " +
-        "round any part of the page and then write: the request then lists what is inside the loop (region " +
-        "ids, their boxes and their text) and shows it, and the new handwriting is a question about just that " +
-        "part. Answer about it, below the new ink as usual. Transcribe the new handwriting into `heard`, " +
+        "page image to see what was marked and where.\n\n" +
+        "The page is paper: the user writes and draws freely, and nothing is sent until they ask. They ask " +
+        "in one of two ways, and the request says which. A loop (shown dashed) round part of the page: what " +
+        "the loop holds is the request, and new ink inside it is the question about the rest of it; with no " +
+        "question, tell them about what it holds. Or Whole page: look at all of it. The rest of the page is " +
+        "context. Answer only the request: do not comment on other ink, and do not add change ideas, notes " +
+        "about yourself or remarks nobody asked for (you may still update your notes, silently).\n\n" +
+        "You know the whole page from the page map: each ink region with its text or what you saw there, " +
+        "or \"not read yet\"; you read each piece once. \"Since your last answer\" says what changed: new " +
+        "ink, marks on your items, and ink the user erased. Put what drawings and marks show in `seen`, and " +
+        "keep `summary` up to date: a short summary of the page and the conversation, which stands for the " +
+        "older turns later. A page can also be a reading: a document the user sent from the computer to read and annotate, " +
+        "shown as reader-view parts; the page map calls it \"the document\". On a reading page, a loop or Whole page asks as " +
+        "usual; Done asks for the digest of their notes. Transcribe the new handwriting into `heard`, " +
         "saying what it marks (for example: circled \"x = 3\" in c4 and wrote \"why?\"). Earlier handwriting " +
-        "that you have read shows as black type in its place; the page map gives its text.\n\n" +
-        "Once you have read the new ink, the app replaces its handwritten text on screen with black type in " +
-        "the same place, from `typeset`. The pieces n1, n2… are strokes that touch, with their boxes, in " +
+        "that you have read: the page map gives its text.\n\n" +
+        "Once you have read the new ink, the app keeps its text from `typeset`: that is how you read each " +
+        "piece of ink once. It shows as type in its place only when the user turned that on. The pieces n1, n2… are strokes that touch, with their boxes, in " +
         "reading order (lines top to bottom, each left to right). For each word, or short run of words on one " +
         "line, of plain handwritten text (match words to pieces by their boxes and the image, never by counting), give " +
         "the ids of all its pieces (with its dots and accents) and its text exactly as written: same " +
@@ -33,7 +43,7 @@ function system(changeChars, webCalls) {
         "cannot read with confidence. When unsure, leave it out.\n\n" +
         "Reply with `items`, placed on the page. Each item has a `kind` (markdown, svg or web), its `content` " +
         "and a `place`:\n" +
-        "- below: directly below the user's newest ink. The default, for normal answers. Several below " +
+        "- below: directly below the request (the loop, or else the user's newest ink). The default, for normal answers. Several below " +
         "items stack in order.\n" +
         "- margin: a short note or small sketch beside the region `ref`, in the free space next to it, in " +
         "smaller text. For a comment on an earlier part of the page.\n" +
@@ -131,7 +141,7 @@ function replyTool(changeChars) {
                             content: { type: "string", description: "Markdown, one standalone SVG document, or for web the page's URL." },
                             mode: { type: "string", enum: ["reader", "screenshot"], description: "For web: reader view (default) or a screenshot." },
                             place: { type: "string", enum: ["below", "margin", "over", "at"],
-                                     description: "below the newest ink, in the margin beside `ref`, over `ref` or a box, or at x, y." },
+                                     description: "below the request (the loop, or else the newest ink), in the margin beside `ref`, over `ref` or a box, or at x, y." },
                             ref: { type: "string", description: "For margin and over: a region id from the page map, such as i3 or c5." },
                             x: { type: "number", description: "Page px, for at and over (or instead of ref)." },
                             y: { type: "number", description: "Page px, for at and over (or instead of ref)." },
@@ -155,7 +165,22 @@ function replyTool(changeChars) {
                             text: { type: "string", description: "The word or words, exactly as written." }
                         }
                     }
-                }
+                },
+                seen: {
+                    type: "array",
+                    description: "Ink regions (iN in the page map) that are no text, such as a drawing, a diagram or a mark, with what they show, in a few words: the app keeps it, so you read each piece once.",
+                    items: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["id", "text"],
+                        properties: {
+                            id: { type: "string", description: "The region, such as i3." },
+                            text: { type: "string", description: "What it shows." }
+                        }
+                    }
+                },
+                digest: { type: "string", description: "Only when the user tapped Done on a reading page: the digest of their notes, in Markdown (see the request). Otherwise leave it out." },
+                summary: { type: "string", description: "Your short summary of the whole page and conversation so far (at most 1500 characters): it replaces your last one, and stands for the older turns in later requests." }
             }
         }
     });

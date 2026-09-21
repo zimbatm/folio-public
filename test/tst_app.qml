@@ -85,11 +85,18 @@ Item {
 
         function init() {
             const r = app.item;
+            // an ask a test left open would keep newPage() from clearing the page
+            r.failed("test");
+            r.pagesOpen = false;
+            if (r.pageId !== "main") { r.showPage("main"); tryVerify(() => r.pageLoaded, 3000); }
+            r.pagesIndex = [{ id: "main", kind: "main", title: "Conversation", state: "" }];
+            r.barShown = true;
+            r.status = "";
             r.dataDir = Qt.resolvedUrl("tmp").toString();
             r.newPage();
             r.eraser = false;
             r.layers = "both";
-            r.sendMode = "button";
+            r.disarmAsk();
             r.apiKey = "";
             r.baseUrl = "";
             r.status = "";
@@ -365,7 +372,7 @@ Item {
             verify(!Qt.colorEqual(g.pixel(240, screenY(r, 330 - bar)), "white"), "the box is drawn");
 
             // the page map tells Claude the typed text
-            verify(r.pageMap(r.context()).indexOf("shown as type: \"hi there\"") >= 0, r.pageMap(r.context()));
+            verify(r.pageMap(r.context()).indexOf("text: \"hi there\"") >= 0, r.pageMap(r.context()));
 
             mouseClick(findChild(r, "moreButton"));
             mouseClick(findChild(r, "typeButton"));
@@ -653,35 +660,7 @@ Item {
             verify(r.transcript().indexOf("Kept **text**") > 0);
         }
 
-        function test_check_mark_sends() {
-            const r = app.item;
-            r.sendMode = "mark";
-            r.apiKey = "test";
-            r.baseUrl = "http://127.0.0.1:9";
-            stroke(r, [[200, 400], [500, 420]]);
-            const before = r.asks;
-            stroke(r, [[600, 400], [615, 415], [630, 430], [660, 390], [690, 350], [720, 310]]);
-            compare(r.asks, before + 1, "the ✓ sends");
-            compare(r.inkCount(), 1, "and is not kept");
-            tryVerify(() => !r.busy, 5000);
-            compare(r.strokeCount, 1, "failed: the ink is still new");
-        }
-
-        function test_pause_sends() {
-            const r = app.item;
-            r.sendMode = "pause";
-            r.pauseSecs = 0.3;
-            r.apiKey = "test";
-            r.baseUrl = "http://127.0.0.1:9";
-            const before = r.asks;
-            stroke(r, [[200, 400], [500, 420]]);
-            tryVerify(() => r.asks === before + 1, 2000);
-            tryVerify(() => !r.busy, 5000);
-            r.sendMode = "button";
-            r.pauseSecs = 4;
-        }
-
-        function test_fingers_scroll_and_double_tap() {
+        function test_fingers_scroll() {
             const r = app.item;
             stroke(r, [[200, 400], [500, 420]]);
             r.receive({ heard: "", items: [{ kind: "markdown", content: "far", place: "at", x: 36, y: 4000, width: 600 }] }, r.context());
@@ -710,33 +689,6 @@ Item {
             wait(100);
             g = grabImage(r);
             verify(!Qt.colorEqual(g.pixel(700, 500), "white"), "and back again");
-
-
-            r.sendMode = "double";
-            r.apiKey = "test";
-            r.baseUrl = "http://127.0.0.1:9";
-            stroke(r, [[200, 600], [500, 620]]);
-            const before = r.asks;
-            for (let k = 0; k < 2; k++) {
-                touchEvent(p).press(0, p, 480, 900).commit();
-                touchEvent(p).release(0, p, 480, 900).commit();
-            }
-            compare(r.asks, before + 1, "a double tap sends");
-            tryVerify(() => !r.busy, 5000);
-        }
-
-        function test_double_tap_sends() {
-            const r = app.item;
-            r.sendMode = "double";
-            r.apiKey = "test";
-            r.baseUrl = "http://127.0.0.1:9";
-            stroke(r, [[200, 400], [500, 420]]);
-            const before = r.asks;
-            r.fingerTap(300, 900);
-            compare(r.asks, before);
-            r.fingerTap(305, 905);
-            compare(r.asks, before + 1);
-            tryVerify(() => !r.busy, 5000);
         }
 
 
@@ -754,7 +706,9 @@ Item {
             r.ask();
             verify(r.busy);
             tryVerify(() => !r.busy, 5000);
-            compare(r.lastImages.length, 2);
+            // the new ink, the page around it, and the earlier ink not read yet
+            compare(r.lastImages.length, r.askCtx.jobs.length);
+            verify(r.askCtx.jobs[0].fresh && r.askCtx.jobs.some(j => j.unread), JSON.stringify(r.askCtx.jobs.map(j => Object.keys(j))));
             const job = r.askCtx.jobs[1].box;
             verify(job.y <= c.y && job.y + job.h >= c.y + c.h, "the page view spans the reply");
 
@@ -845,7 +799,7 @@ Item {
             for (let k = 0; k < 7; k++) words.push(r.typedWord(k).text);
             compare(words.join(" "), "That's useful, but also I want to be");
             const map = r.pageMap(r.context());
-            verify(map.indexOf("shown as type: \"That's useful, but also I want to be\"") >= 0, map);
+            verify(map.indexOf("text: \"That's useful, but also I want to be\"") >= 0, map);
             // the rewrite pad's context is the word's own line
             compare(r.lineOf(3), "That's useful, but also I");
         }
@@ -1291,7 +1245,7 @@ Item {
         function test_toolbar_hides() {
             const r = app.item;
             const bar_ = findChild(r, "toolbar"), tab = findChild(r, "barTab"), p = r.pageView();
-            for (const name of ["askButton", "undoButton", "eraserButton", "lassoButton", "moreButton", "closeButton"]) {
+            for (const name of ["askButton", "undoButton", "eraserButton", "moreButton", "closeButton"]) {
                 const b = findChild(r, name);
                 verify(b && b.visible, name);
                 verify(b.height >= 60 && b.width >= 60, name + " is large enough");
@@ -1358,7 +1312,8 @@ Item {
 
         // a loop round a reply, then a question: the request is about it, and
         // the dashed loop goes once the reply is placed
-        function test_lasso_asks_about_part() {
+        // Ask arms the lasso; the loop is the request, sent when it closes
+        function test_loop_is_the_request() {
             const r = app.item;
             stroke(r, [[100, 300], [300, 340]]);
             r.receive({ heard: "", items: [{ kind: "markdown", content: "The capital of France is Paris.", place: "below" }] }, r.context());
@@ -1372,85 +1327,303 @@ Item {
                 for (let x = c.x; x < c.x + 400; x += 2) if (!Qt.colorEqual(g.pixel(x, screenY(r, c.y - 20)), "white")) k++;
                 return k;
             };
-            mouseClick(findChild(r, "lassoButton"));
-            verify(r.lassoMode);
-            verify(findChild(r, "lassoButton").primary);
-            stroke(r, loop());
-            compare(r.inkCount(), n, "the loop is not ink");
-            verify(!r.lassoMode && r.lassoId > 0);
-            wait(100);
-            const k = dashes();
-            verify(k > 40 && k < 180, "a dashed outline: " + k);
-            // Undo takes the loop away, not the ink
-            r.undoStroke();
-            compare(r.lassoId, 0);
-            compare(r.inkCount(), n);
-            wait(100);
-            compare(dashes(), 0, "the outline is gone");
-
-            mouseClick(findChild(r, "lassoButton"));
-            stroke(r, loop());
-            verify(r.lassoId > 0);
-            const parts = r.lassoParts();
-            compare(parts.length, 1, JSON.stringify(parts));
-            compare(parts[0].id, "c0");
-            // the question
-            stroke(r, [[100, 1000], [300, 1040]]);
             const bodies = [];
             r.jobPoster = (body, p) => bodies.push({ body: body, p: p });
             r.apiKey = "test";
             r.baseUrl = "http://127.0.0.1:9";
-            r.ask();
-            tryVerify(() => bodies.length === 1, 5000);
+            const ask = findChild(r, "askButton");
+            verify(ask.enabledState, "Ask works with no new ink");
+            // Undo cancels an armed Ask
+            mouseClick(ask);
+            verify(r.askArmed && r.lassoMode);
+            compare(ask.label, "Whole page");
+            r.undoStroke();
+            verify(!r.askArmed && !r.lassoMode);
+            compare(r.inkCount(), n, "and takes no ink");
+
+            mouseClick(ask);
+            stroke(r, loop());
+            compare(r.inkCount(), n, "the loop is not ink");
+            tryVerify(() => bodies.length === 1, 5000, "sent when the loop closes");
+            verify(!r.askArmed && r.lassoId > 0);
+            wait(100);
+            const k = dashes();
+            verify(k > 40 && k < 180, "a dashed outline: " + k);
             const content = bodies[0].body.messages[0].content;
             const text = content[0].text;
-            const at = text.indexOf("Lasso:");
+            const at = text.indexOf("The request: the user drew a loop");
             verify(at >= 0, text);
-            const part = text.slice(at, text.indexOf("\n\n", at));
+            const part = text.slice(at);
             verify(part.indexOf("c0: your markdown") >= 0 && part.indexOf("\"The capital of France is Paris.\"") >= 0, part);
-            verify(part.indexOf("x " + Math.round(c.x) + "–" + Math.round(c.x + c.w)) >= 0, "its box: " + part);
+            verify(part.indexOf("It holds no new ink") >= 0, part);
             verify(part.indexOf("i1") < 0, "not the ink outside the loop: " + part);
-            verify(r.askCtx.jobs.some(j => j.loop), "an image of the lassoed part");
+            verify(text.indexOf("There is no new ink since your last answer.") >= 0, text);
+            verify(r.askCtx.jobs.some(j => j.loop), "an image of what the loop holds");
             compare(content.filter(x => x.type === "image").length, r.askCtx.jobs.length);
-            verify(bodies[0].body.system.indexOf("lasso") >= 0, "the prompt explains the lasso");
-            verify(r.lassoId > 0, "kept until the reply is placed");
-            r.answered({ content: [{ type: "tool_use", name: "reply", input: { heard: "why?", items: [
+            verify(bodies[0].body.system.indexOf("The page is paper") >= 0, "the prompt explains the requests");
+            r.answered({ content: [{ type: "tool_use", name: "reply", input: { heard: "", items: [
                 { kind: "markdown", content: "It has been since 987.", place: "below" }] } }] }, bodies[0].p);
             compare(r.replyCount(), 2);
-            compare(r.lassoId, 0, "the loop goes once the reply is placed");
+            verify(r.itemBox(1).y > c.y + c.h, "the answer goes below the loop: " + JSON.stringify(r.itemBox(1)));
+            compare(r.lassoId, 0, "the loop goes once the answer is placed");
             wait(100);
             compare(dashes(), 0, "and its outline");
         }
 
+        // new ink inside the loop is the question about the rest of it
+        function test_question_inside_the_loop() {
+            const r = app.item;
+            r.receive({ heard: "", items: [{ kind: "markdown", content: "Water boils at 100 °C.", place: "below" }] }, r.context());
+            const c = r.itemBox(0);
+            // "why?" written under the reply, inside the loop
+            stroke(r, [[c.x + 20, screenY(r, c.y + c.h + 30)], [c.x + 120, screenY(r, c.y + c.h + 60)]]);
+            const bodies = [];
+            r.jobPoster = (body, p) => bodies.push({ body: body, p: p });
+            r.apiKey = "test";
+            r.baseUrl = "http://127.0.0.1:9";
+            r.armAsk();
+            stroke(r, [[c.x - 20, screenY(r, c.y - 20)], [c.x + 500, screenY(r, c.y - 20)], [c.x + 500, screenY(r, c.y + c.h + 100)],
+                       [c.x - 20, screenY(r, c.y + c.h + 100)], [c.x - 20, screenY(r, c.y - 10)]]);
+            tryVerify(() => bodies.length === 1, 5000);
+            const text = bodies[0].body.messages[0].content[0].text;
+            verify(text.indexOf("The new ink inside it") >= 0 && text.indexOf("is the question") >= 0, text.slice(text.indexOf("The request")));
+            verify(r.askCtx.jobs.some(j => j.fresh) && r.askCtx.jobs.some(j => j.loop), "the new ink and the loop");
+        }
+
+        // read once: what the agent saw in a drawing stays, also after a reopen
+        function test_seen_is_kept() {
+            const r = app.item;
+            stroke(r, [[100, 300], [300, 500], [100, 500], [100, 300]]);
+            let ctx = r.context();
+            r.receive({ heard: "", items: [], seen: [{ id: "i1", text: "a triangle" }] }, ctx);
+            verify(r.pageMap(r.context()).indexOf("i1: ink, turn 1, x 100–300, y 216–416, seen as: a triangle") >= 0, r.pageMap(r.context()));
+            r.savePage();
+            wait(100);
+            gc();
+            r.restorePage({ strokes: [], items: [], turns: [] });
+            r.loadPage();
+            tryVerify(() => r.pageMap(r.context()).indexOf("seen as: a triangle") >= 0, 3000, r.pageMap(r.context()));
+        }
+
+        // since your last answer: new ink, marks on items, erased ink
+        function test_changes_since_last_answer() {
+            const r = app.item;
+            stroke(r, [[100, 300], [300, 340]]);
+            r.receive({ heard: "", items: [{ kind: "markdown", content: "An answer.", place: "below" }] }, r.context());
+            const c = r.itemBox(0);
+            // erase the old ink, mark the answer
+            r.eraser = true;
+            stroke(r, [[100, 300], [200, 320], [300, 340]]);
+            r.eraser = false;
+            verify(r.erasedSince.length > 0, "the erase is recorded");
+            stroke(r, [[c.x + 10, screenY(r, c.y + c.h / 2)], [c.x + 200, screenY(r, c.y + c.h / 2)]]);
+            const ctx = r.context();
+            ctx.erased = r.erasedSince;
+            const t = r.changesText(ctx);
+            verify(t.indexOf("- new ink i") >= 0, t);
+            verify(t.indexOf("the new ink touches your items c0") >= 0, t);
+            verify(t.indexOf("the user erased earlier ink at x") >= 0, t);
+            // an ask takes the list with it
+            r.jobPoster = (body, p) => {};
+            r.apiKey = "test";
+            r.baseUrl = "http://127.0.0.1:9";
+            r.ask();
+            tryVerify(() => r.erasedSince.length === 0, 3000);
+            verify(r.askCtx.erased.length > 0);
+        }
+
+        // the page map is the whole page, and older turns are the summary
+        function test_whole_page_map_and_summary() {
+            const r = app.item;
+            for (let k = 0; k < 14; k++)
+                r.receive({ heard: "q" + k, items: [{ kind: "markdown", content: "Answer " + k + ".", place: "at", x: 36, y: 200 + k * 800, width: 600 }],
+                            summary: k === 13 ? "Fourteen answers, numbered." : "" }, r.context());
+            const map = r.pageMap(r.context());
+            verify(map.indexOf("\"Answer 0.\"") >= 0 && map.indexOf("\"Answer 13.\"") >= 0, "the whole page: " + map);
+            const tr = r.transcript();
+            verify(tr.indexOf("Your summary of the page and of turns 1 to 2:\nFourteen answers, numbered.") === 0, tr.slice(0, 200));
+            verify(tr.indexOf("Turn 1.") < 0 && tr.indexOf("Turn 14.") >= 0, "the recent turns follow");
+        }
+
+        // a reading: sent from the computer, read and marked, Done for the digest
+        function test_reading_page() {
+            const r = app.item;
+            stroke(r, [[100, 300], [300, 340]]);
+            const mainInk = r.inkCount();
+            verify(!findChild(r, "titleRow").visible, "one page: no title row");
+            r.mergeInbox([{ id: "d1abcdef01", title: "Rollout plan", from: "laptop", state: "new" }, { id: "d2old00000", title: "Old", state: "done" }]);
+            compare(r.pagesIndex.length, 2, "a done document is not added");
+            compare(r.toRead, 1);
+            verify(findChild(r, "titleRow").visible, "the title row shows");
+            r.pagesOpen = true;
+            wait(50);
+            compare(findChild(r, "pageList").count, 2);
+            r.showPage("d1abcdef01");
+            verify(r.readingPage && !r.pagesOpen);
+            verify(!r.barShown, "no toolbar while reading");
+            compare(r.inkCount(), 0, "a page of its own");
+            // the server is not there in the tests: place the document by hand
+            tryVerify(() => r.pageLoaded, 3000);
+            r.placeDocument({ id: "d1abcdef01", title: "Rollout plan", from: "laptop", kind: "markdown",
+                              content: "# Rollout\n\nShip the API first, then migrate the users.\n\n## Risks\n\nThe migration may be slow." });
+            verify(r.replyCount() >= 1);
+            const it = r.replyItem(0);
+            compare(it.kind, "web");
+            compare(it.url, "folio:doc/d1abcdef01");
+            verify(r.pageMap(r.context()).indexOf("the document \"Rollout plan\" the user reads (sent from laptop)") >= 0, r.pageMap(r.context()));
+            verify(findChild(r, "doneButton").visible, "Done is in the title row");
+            verify(!findChild(r, "newButton").enabledState, "New page keeps the document");
+            // a mark over the text
+            wait(200);
+            const d = r.webDelegate(0);
+            const b = r.itemBox(0);
+            const ty = b.y + b.h * 0.5;
+            stroke(r, [[b.x + 20, screenY(r, ty)], [b.x + 400, screenY(r, ty)]]);
+            const marks = r.docMarks(r.context());
+            verify(marks.length === 1 && marks[0].indexOf("is over: \"") > 0, JSON.stringify(marks));
+            // Done: the digest
+            const bodies = [];
+            r.jobPoster = (body, p) => bodies.push({ body: body, p: p });
+            r.apiKey = "test";
+            r.baseUrl = "http://127.0.0.1:9";
+            r.doneReading();
+            tryVerify(() => bodies.length === 1, 5000);
+            const text = bodies[0].body.messages[0].content[0].text;
+            verify(text.indexOf("The request: the user finished reading \"Rollout plan\" (sent from laptop)") >= 0, text.slice(text.indexOf("The request")));
+            verify(text.indexOf("Ship the API first") > 0 && text.indexOf("Their marks over the document:\n- i1") > 0, "the document and the marks");
+            r.answered({ content: [{ type: "tool_use", name: "reply", input: { heard: "", items: [], digest: "**Decision:** ship the API first." } }] }, bodies[0].p);
+            const last = r.replyItem(r.replyCount() - 1);
+            verify(last.kind === "markdown" && last.content.indexOf("## Your notes") === 0, last.content);
+            compare(r.currentPage.state, "done");
+            verify(!findChild(r, "doneButton").visible);
+            // back to the conversation, as it was
+            r.showPage("main");
+            verify(!r.readingPage && r.barShown);
+            tryVerify(() => r.inkCount() === mainInk, 3000, "the conversation's ink is back");
+        }
+
+        // on a reading page a finger tap at an edge turns a screen; the pages
+        // are kept across a reopen
+        function test_reading_edges_and_pages_kept() {
+            const r = app.item;
+            r.mergeInbox([{ id: "d3abcdef01", title: "Long read", state: "new" }]);
+            r.showPage("d3abcdef01");
+            tryVerify(() => r.pageLoaded, 3000);
+            let md = "";
+            for (let k = 0; k < 60; k++) md += "Paragraph " + k + " of a long read, with enough words to wrap on the page.\n\n";
+            r.placeDocument({ id: "d3abcdef01", title: "Long read", kind: "markdown", content: md });
+            wait(200);
+            const p = r.pageView();
+            p.contentY = 0;
+            const down = findChild(r, "edgeDown");
+            verify(down.visible);
+            const t = touchEvent(down);
+            t.press(0, down, down.width / 2, down.height / 2).commit();
+            t.release(0, down, down.width / 2, down.height / 2).commit();
+            tryVerify(() => p.contentY > p.height * 0.5, 2000, "a screen down: " + p.contentY);
+            const y = p.contentY;
+            const up = findChild(r, "edgeUp");
+            const u = touchEvent(up);
+            u.press(0, up, up.width / 2, up.height / 2).commit();
+            u.release(0, up, up.width / 2, up.height / 2).commit();
+            tryVerify(() => p.contentY < y, 2000, "and back up");
+            // the list of pages, and which one is open, come back
+            r.savePages();
+            wait(100);
+            gc();
+            r.pagesIndex = [{ id: "main", kind: "main", title: "Conversation", state: "" }];
+            r.loadPages(() => {});
+            tryVerify(() => r.pagesIndex.length === 2 && r.pageId === "d3abcdef01", 3000, JSON.stringify(r.pagesIndex));
+        }
+
+        // a PDF to read: its pages as pictures from the server, and a mark on a
+        // page read as the words under it
+        function test_pdf_pages() {
+            const r = app.item;
+            r.serverToken = "st0k";
+            const src = r.serverUrl + "/v1/inbox/pdf0000001/page/1";
+            const pages = {};
+            pages[src] = { png: true };
+            fakeWeb(r, pages);
+            let heads = null;
+            const serve = r.fetcher;
+            r.fetcher = (url, opts, done) => { heads = opts.headers; serve(url, opts, done); };
+            r.mergeInbox([{ id: "pdf0000001", title: "Plan", state: "new" }]);
+            r.showPage("pdf0000001");
+            tryVerify(() => r.pageLoaded, 3000);
+            r.placeDocument({ id: "pdf0000001", title: "Plan", kind: "pdf", pages: [{ w: 400, h: 200, words: [
+                { t: "Ship", x0: 10, y0: 10, x1: 60, y1: 40 }, { t: "now", x0: 70, y0: 10, x1: 120, y1: 40 },
+                { t: "later", x0: 10, y0: 150, x1: 80, y1: 180 }] }] });
+            tryVerify(() => r.replyCount() === 1, 5000, "the page, placed");
+            compare(heads && heads["x-api-key"], "st0k", "the page picture is fetched with the server's token");
+            wait(200);
+            const ib = r.webDelegate(0).imageBoxes()[0];
+            verify(ib && ib.w > 0, JSON.stringify(ib));
+            const s = ib.w / 400;
+            // an underline under "Ship now" (no toolbar on a reading page)
+            const pv = r.pageView(), top = pv.mapToItem(r, 0, 0).y - pv.contentY;
+            const y = ib.y + 44 * s + top;
+            stroke(r, [[ib.x + 8 * s, y], [ib.x + 124 * s, y]]);
+            const marks = r.docMarks(r.context());
+            verify(marks.length === 1 && marks[0].indexOf("is over: \"Ship now\"") > 0, JSON.stringify(marks));
+            verify(r.docText().indexOf("Page 1: Ship now later") >= 0, r.docText());
+            r.serverToken = "";
+        }
+
+        // Ask twice: the whole page; a tap cancels
+        function test_whole_page_and_cancel() {
+            const r = app.item;
+            const bodies = [];
+            r.jobPoster = (body, p) => bodies.push({ body: body, p: p });
+            r.apiKey = "test";
+            r.baseUrl = "http://127.0.0.1:9";
+            const ask = findChild(r, "askButton");
+            mouseClick(ask);
+            verify(r.askArmed);
+            r.fingerTap(400, 900);
+            verify(!r.askArmed, "a finger tap cancels");
+            compare(bodies.length, 0);
+            stroke(r, [[100, 400], [300, 440]]);
+            mouseClick(ask);
+            mouseClick(ask);
+            tryVerify(() => bodies.length === 1, 5000);
+            compare(r.askCtx.request, "whole");
+            const text = bodies[0].body.messages[0].content[0].text;
+            verify(text.indexOf("The request: the user tapped Whole page") >= 0, text);
+        }
+
+        // a loop round the user's typed words: their text goes with it
         // a loop round the user's typed words: their text goes with it
         function test_lasso_round_ink() {
             const r = app.item;
             writeWords(r);
             r.receive({ heard: "hi there", items: [], typeset: [{ ids: ["n2"], text: "hi" }, { ids: ["n3"], text: "there" }] }, r.context());
             tryVerify(() => r.typedCount() === 2, 2000);
-            r.toggleLasso();
+            const bodies = [];
+            r.jobPoster = (body, p) => bodies.push({ body: body, p: p });
+            r.apiKey = "test";
+            r.baseUrl = "http://127.0.0.1:9";
+            r.armAsk();
+            // a tap is no loop: still armed
+            mouseClick(r, 600, 900);
+            verify(r.askArmed && bodies.length === 0);
             // round the second word only (page x 300–380, y 316–366)
             stroke(r, [[280, screenY(r, 300)], [400, screenY(r, 300)], [400, screenY(r, 390)], [280, screenY(r, 390)], [280, screenY(r, 305)]]);
-            const parts = r.lassoParts();
+            tryVerify(() => bodies.length === 1, 5000);
+            const parts = r.askCtx.lasso.parts;
             compare(parts.length, 1, JSON.stringify(parts));
             compare(parts[0].id, "i1");
             compare(parts[0].text, "there");
             verify(parts[0].part, "a part of the region");
-            // saved with the page
+            // saved with the page until the answer comes
             const id = r.lassoId;
+            verify(id > 0);
             r.savePage();
             wait(100);
             r.restorePage({ strokes: [], items: [], turns: [] });
             compare(r.lassoId, 0);
             r.loadPage();
             tryVerify(() => r.lassoId === id);
-            // a tap in lasso mode is no loop; Lasso twice drops the loop
-            r.toggleLasso();
-            mouseClick(r, 600, 900);
-            verify(r.lassoMode && r.lassoId === id);
-            r.toggleLasso();
-            verify(!r.lassoMode);
-            compare(r.lassoId, 0);
         }
 
         function test_markdown() {
@@ -1497,6 +1670,24 @@ Item {
             compare(r.baseUrl, "http://b:1");
             r.serverUrl = "http://127.0.0.1:18082";
             r.serverToken = "";
+        }
+
+        // ink stays ink: an old "typed" setting does not come back, a new one does
+        function test_type_setting_migration() {
+            const r = app.item;
+            r.showType = false;
+            r.filePut(r.dataDir + "/settings.json", JSON.stringify({ type: true, send: "pause", pause: 4 }));
+            wait(100);
+            gc();
+            r.loadSettings();
+            wait(300);
+            verify(!r.showType, "settings before v2: ink stays ink");
+            r.filePut(r.dataDir + "/settings.json", JSON.stringify({ v: 2, type: true }));
+            wait(100);
+            gc();
+            r.loadSettings();
+            tryVerify(() => r.showType, 3000, "a choice made since");
+            r.showType = true;
         }
 
         // settings saved before the layer value was renamed still load

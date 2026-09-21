@@ -7,6 +7,8 @@ request, the builder makes a new version, and you install it.
 This file is the one description of the whole system. The builder reads it
 before each build, and the assistant gets a summary of it in each ask. When a
 change touches the design, update this file in the same commit.
+`docs/DESIGN.md` is where the app goes next (paper first: nothing reacts until
+you ask; reading pages).
 
 ## The parts
 
@@ -16,6 +18,7 @@ change touches the design, update this file in the same commit.
 | **Folio server** | a server host | `server/` | builds versions, serves them, mirrors and searches the notebooks, keeps the job logs |
 | **Folio bridge** | a server host | `bridge/` | the model: the Messages API on top of `claude -p` |
 | **Tablet setup** | the tablet, as root | `tablet/` | xovi at boot, the notes push |
+| **`folio` command** | your computer | `cli/` | sends something to read to the tablet, prints the digests of your notes |
 
 The server and the bridge are Go programs with no dependencies.
 `nix/module.nix` (`nixosModules.default` in `flake.nix`) runs both as one
@@ -30,10 +33,15 @@ through `/home/root/.config/folio/folio.env` (see `tablet/README.md`).
 
 ## An ask
 
-1. The app sends a job to the bridge: `POST /v1/jobs` with the page (text,
-   the page map, images of the new ink), the conversation, Folio's notes, the
-   recent builds, and a self-report (the version, the model, Folio's recent
-   log lines). It polls `GET /v1/jobs/{id}`.
+1. You tap **Ask** and draw a loop (what it holds is the request), or tap it
+   twice (the whole page). Nothing else sends. The app sends a job to the
+   bridge: `POST /v1/jobs` with the request; what changed since the last
+   answer (new ink, marks on its items, erased ink); the map of the whole page
+   (each ink region with its text, or what the agent saw there: it reads each
+   piece once); images of the new ink, the loop, or ink not read yet; the
+   conversation (recent turns, and the agent's own summary of older ones);
+   Folio's notes, the recent builds, and a self-report (the version, the
+   model, Folio's recent log lines). It polls `GET /v1/jobs/{id}`.
 2. The bridge runs `claude -p` with no tools. The client's tools (`reply`,
    `web_search`, `fetch_url`, `weather`, `screenshot`) become one structured
    output: the model picks one call. The tablet runs web calls itself and asks
@@ -71,6 +79,22 @@ The builder's limits, in order of strength:
 - Versions are text (QML/JS). The loader, the icon, the manifest and the
   native backend ship only with `./build.sh --install`, which needs the SDK and
   a person.
+
+## Reading pages
+
+`folio send` posts a document to the server's inbox (`POST /v1/inbox`: Markdown,
+text, code or a diff, shown as Markdown; a URL, which the tablet opens itself;
+or a PDF or a picture, which the server renders to a PNG a page with poppler,
+keeping each word's box, served at `GET /v1/inbox/{id}/page/{n}`; a mark on a
+page picture is read as the words under it). The app checks the inbox (`GET /v1/inbox`) at start and every 5
+minutes, and each new document becomes a page: `pages.json` lists the pages,
+and each keeps its own `page-<id>.json` (the conversation is `page.json`).
+The title row shows the page and "N to read"; **Pages** switches, not while an
+ask runs. A reading page shows the document as reader-view parts (the address
+`folio:doc/<id>`), without the toolbar; finger taps at the edges turn a screen.
+**Done** asks for the digest: the document, each mark with the text under it,
+and images of the ink. The digest goes on the page and to the server
+(`POST /v1/inbox/{id}`), where `folio notes` and `folio send --wait` read it.
 
 ## The notes mirror
 

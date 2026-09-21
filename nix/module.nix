@@ -73,6 +73,7 @@ in
       "d ${home}/notes 0750 ${cfg.user} folio -"
       "d ${home}/bridge 0700 ${cfg.user} folio -"
       "d ${home}/server 0700 ${cfg.user} folio -"
+      "d ${home}/inbox 0750 ${cfg.user} folio -"
     ];
 
     systemd.services.folio-server = {
@@ -113,6 +114,12 @@ in
             (lib.getExe' cfg.claude "claude")
             "--notes"
             "${home}/notes"
+            "--inbox"
+            "${home}/inbox"
+            "--pdftoppm"
+            (lib.getExe' pkgs.poppler-utils "pdftoppm")
+            "--pdftotext"
+            (lib.getExe' pkgs.poppler-utils "pdftotext")
             "--rmc"
             (lib.getExe pkgsFolio.rmc)
             "--rsvg"
